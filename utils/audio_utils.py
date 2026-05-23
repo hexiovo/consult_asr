@@ -1,4 +1,5 @@
 from pydub import AudioSegment
+import os
 
 AudioSegment.converter = r"G:\conda\.conda\envs\consult_asr\Library\bin\ffmpeg.exe"
 AudioSegment.ffprobe = r"G:\conda\.conda\envs\consult_asr\Library\bin\ffprobe.exe"
@@ -18,3 +19,18 @@ def split_audio(file_path, chunk_minutes=15):
         chunks.append((chunk_path, i / 1000))
 
     return chunks
+
+def is_audio_file(path):
+    return os.path.splitext(path)[1].lower() in {
+        ".wav", ".mp3", ".m4a", ".flac", ".aac", ".ogg"
+    }
+
+
+def collect_audio_files(input_dir):
+    audio_files = []
+    for root, _, files in os.walk(input_dir):
+        for f in files:
+            full_path = os.path.join(root, f)
+            if is_audio_file(full_path):
+                audio_files.append(full_path)
+    return audio_files
