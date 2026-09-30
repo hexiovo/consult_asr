@@ -1,7 +1,14 @@
 # Version
 
-Current version: **2.0.2**  
+Current version: **2.0.3**
 Updated: 2026-09-30
+
+## 2.0.3
+
+- Document the successful offline model-asset verification and local CPU initialization of `SpeakerDiarization` using the project's real loader.
+- Record the scope boundary: no audio forward, real recording, GPU model inference, one-hour throughput, or transcription/speaker accuracy test was run; GPU compatibility acceptance remains blocked.
+- Clarify that the `manifest` records resolved pyannote revisions, while the preparation source does not pin a fixed pyannote revision.
+- Documentation and version record only; application source code was not changed.
 
 ## 2.0.2
 

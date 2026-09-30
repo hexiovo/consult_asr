@@ -45,6 +45,8 @@ Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使�
 - 默认模型目录：`local_models/faster-whisper-large-v3`、`local_models/pyannote/speaker-diarization-3.1` 和 `local_models/openai-whisper`。设置 `CONSULT_ASR_MODEL_DIR` 可切换统一的模型根目录。
 - FFmpeg 优先取 `CONSULT_ASR_FFMPEG`，其次检查当前进程 PATH、当前 Conda 环境及 Conda 环境清单中的项目环境。若无法自动发现，可在当前 PowerShell 会话设置 `CONSULT_ASR_FFMPEG` 指向 `ffmpeg.exe`。程序只规范化到任务专属临时目录，不改写源音频。
 - 模型准备依赖网络；模型齐全后，识别和说话人区分在离线模式运行。模型或关联检查点未准备好时，界面会禁用“开始处理”，不会自动请求下载。
+- 当前工作副本的 `python tools/prepare_models.py --verify` 于 2026-09-30 通过；本地 `config.yaml` 的 segmentation 和 embedding 绝对 checkpoint 路径均存在。真实加载器 `core.diarizer.Diarizer(device="cpu").load()` 在 Hugging Face/Transformers 离线标记、`CUDA_VISIBLE_DEVICES=-1` 且未提供 token 时，成功初始化 `pyannote.audio 3.1.1` 的 `SpeakerDiarization`。这验证本地权重和 CPU pipeline 初始化，不包含音频 forward、实际录音或 GPU 推理；GPU 兼容验收仍待完成。
+- 本地 manifest 记录三个 pyannote 仓库各自解析出的 40 位 revision。准备工具没有指定固定 pyannote revision，清单值反映这些本地模型实际对应的版本。
 - 质量优先默认 beam 5 与 float16；CPU 自动改用兼容精度，速度选项使用 int8_float16（CPU 上使用 int8）。每次只处理一个音频文件，并在 ASR 和说话人区分阶段间释放模型。
 
 ## 结果边界
