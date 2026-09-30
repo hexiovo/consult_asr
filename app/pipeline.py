@@ -1,509 +1,220 @@
+from __future__ import annotations
+
+import gc
 import os
-import threading
-import torch
-from tkinter import messagebox
+import re
+import shutil
+import tempfile
+import time
+import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+from threading import Event
+from typing import Any, Callable, Mapping
 
-
-from utils.logger import setup_logger
-from utils.audio_utils import split_audio
-from utils.audio_utils import collect_audio_files
-from core.transcriber import Transcriber
+from config import TEMP_ROOT
+from core.aligner import align_words
 from core.diarizer import Diarizer
-from core.aligner import align_segments
-from core.role_identifier import identify_roles
-from core.exporter import export_word
-from core.doc_postprocessor import merge_speaker_text
-from config import CHUNK_MINUTES
-from app.gui import (
-    select_audio,
-    ask_filename,
-    show_success,
-    show_error,
-    ProgressWindow,
-    select_folder,
-    select_output_folder
-)
-
-
-def run_single():
-
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    logger, log_path = setup_logger(BASE_DIR)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    logger.info("选择了单一文件模式")
-    logger.info(f"运行设备: {device}")
-
-    file_path = select_audio()
-
-    if not file_path:
-        return
-
-    # 自动提取文件名
-    filename = os.path.splitext(os.path.basename(file_path))[0]
-
-    if not filename:
-        return
-
-    logger.info(f"选择音频: {file_path}")
-    logger.info(f"输出文件名: {filename}")
-
-    # 输出目录 = 输入目录
-    OUTPUT_DIR = os.path.dirname(file_path)
-
-    progress = ProgressWindow("语音处理进度")
-
-    # ===== 模型只初始化一次 =====
-    transcriber = Transcriber(device)
-    diarizer = Diarizer(device)
-
-    def worker():
-
-        try:
-
-            _task(
-                file_path=file_path,
-                filename=filename,
-                OUTPUT_DIR=OUTPUT_DIR,
-                device=device,
-                logger=logger,
-                log_path=log_path,
-                progress=progress,
-                transcriber=transcriber,
-                diarizer=diarizer
-            )
-
-            # ===== 主线程关闭窗口 =====
-            progress.root.after(0, progress.close)
-
-        except Exception as e:
-
-            import traceback
-
-            logger.error(
-                "单文件处理失败:\n%s",
-                traceback.format_exc()
-            )
-
-            def show_err():
-                show_error(str(e))
-
-            progress.root.after(0, show_err)
-            progress.root.after(0, progress.close)
-
-    threading.Thread(
-        target=worker,
-        daemon=False
-    ).start()
-
-    # ===== 主线程事件循环 =====
-    progress.root.mainloop()
-
-
-def run_pipeline():
-
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    logger, log_path = setup_logger(BASE_DIR)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    logger.info(f"运行设备: {device}")
-
-    # ===== 选择输入目录 =====
-    input_dir = select_folder()
-
-    if not input_dir:
-        return
-
-    # ===== 选择输出目录 =====
-    output_root = select_output_folder()
-
-    if not output_root:
-        return
-
-    # ===== 安全检查 =====
-    if os.path.abspath(input_dir) == os.path.abspath(output_root):
-
-        messagebox.showerror(
-            "错误",
-            "输入目录和输出目录不能相同"
-        )
-
-        return
-
-    logger.info(f"输入目录: {input_dir}")
-    logger.info(f"输出目录: {output_root}")
-
-    # ===== 收集音频 =====
-    audio_files = collect_audio_files(input_dir)
-
-    if not audio_files:
-
-        logger.warning("未找到音频文件")
-
-        messagebox.showwarning(
-            "提示",
-            "未找到音频文件"
-        )
-
-        return
-
-    total = len(audio_files)
-
-    logger.info(f"共检测到 {total} 个音频文件")
-
-    progress = ProgressWindow("批量语音处理进度")
-
-    # ===== 模型只初始化一次 =====
-    transcriber = Transcriber(device)
-    diarizer = Diarizer(device)
-
-    def batch_task():
-
-        try:
-
-            for idx, file_path in enumerate(audio_files, 1):
-
-                try:
-
-                    # ===== 相对路径 =====
-                    rel_path = os.path.relpath(
-                        file_path,
-                        input_dir
-                    )
-
-                    # 去扩展名
-                    rel_no_ext = os.path.splitext(rel_path)[0]
-
-                    # ===== 输出目录 =====
-                    output_dir = os.path.join(
-                        output_root,
-                        os.path.dirname(rel_no_ext)
-                    )
-
-                    os.makedirs(output_dir, exist_ok=True)
-
-                    filename = os.path.basename(rel_no_ext)
-
-                    logger.info(
-                        f"[{idx}/{total}] 处理: {file_path}"
-                    )
-
-                    logger.info(f"输出目录: {output_dir}")
-
-                    # ===== 主线程更新UI =====
-                    progress.root.after(
-                        0,
-                        lambda i=idx, t=total, f=filename:
-                        progress.update(
-                            f"[{i}/{t}] 处理:\n{f}"
-                        )
-                    )
-
-                    # ===== 执行任务 =====
-                    _task(
-                        file_path=file_path,
-                        filename=filename,
-                        OUTPUT_DIR=output_dir,
-                        device=device,
-                        logger=logger,
-                        log_path=log_path,
-                        progress=progress,
-                        transcriber=transcriber,
-                        diarizer=diarizer
-                    )
-
-                except Exception as e:
-
-                    import traceback
-
-                    logger.error(
-                        f"失败: {file_path}\n"
-                        f"{traceback.format_exc()}"
-                    )
-
-            logger.info("批处理完成")
-
-            # ===== 主线程UI =====
-            def finish():
-
-                progress.update("全部处理完成")
-
-                show_success(
-                    output_root,
-                    log_path
-                )
-
-                progress.close()
-
-            progress.root.after(0, finish)
-
-        except Exception as e:
-
-            import traceback
-
-            logger.error(
-                "批处理异常:\n%s",
-                traceback.format_exc()
-            )
-
-            def show_err():
-
-                show_error(str(e))
-
-                progress.close()
-
-            progress.root.after(0, show_err)
-
-    threading.Thread(
-        target=batch_task,
-        daemon=False
-    ).start()
-
-    progress.root.mainloop()
-
-def _task(
-        file_path,
-        filename,
-        OUTPUT_DIR,
-        device,
-        logger,
-        log_path,
-        progress,
-        transcriber,
-        diarizer
-):
-
-    chunks = []
-    temp_wav = None
-
+from core.exporter import write_exports
+from core.transcriber import Transcriber
+from utils.audio_utils import ProcessingCancelled, normalize_audio
+
+
+ProgressCallback = Callable[[str], None]
+
+
+@dataclass
+class FileAnalysis:
+    input_path: Path
+    output_dir: Path
+    status: str
+    words: list[dict[str, Any]] = field(default_factory=list)
+    segments: list[dict[str, Any]] = field(default_factory=list)
+    duration_seconds: float | None = None
+    elapsed_seconds: float = 0.0
+    error: str = ""
+    word_path: Path | None = None
+    json_path: Path | None = None
+    roles_confirmed: bool = False
+    counselor_speaker: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.input_path.name
+
+
+def _duration_seconds(path: Path) -> float | None:
     try:
+        with wave.open(str(path), "rb") as audio:
+            rate = audio.getframerate()
+            return audio.getnframes() / rate if rate else None
+    except (OSError, wave.Error):
+        return None
 
-        display_name = filename
 
-        # =========================================================
-        # 1. 切分音频
-        # =========================================================
+def _safe_error(exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    for key in ("HF_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+        value = os.environ.get(key)
+        if value:
+            message = message.replace(value, "[已隐藏凭据]")
+    message = re.sub(r"\bhf_[A-Za-z0-9]{16,}\b", "[已隐藏凭据]", message)
+    return message[:700]
 
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 1/7 正在切分音频..."
-            )
-        )
 
-        logger.info("开始音频切分")
+def _release_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
-        chunks = split_audio(
-            file_path,
-            chunk_minutes=CHUNK_MINUTES
-        )
 
-        logger.info(
-            f"音频切分完成，共 {len(chunks)} 个片段"
-        )
+class ConsultationPipeline:
+    """Analyze one audio file at a time, releasing ASR before diarization."""
 
-        # =========================================================
-        # 2. 语音识别
-        # =========================================================
+    def __init__(
+        self,
+        *,
+        device: str = "cuda",
+        compute_type: str | None = None,
+        beam_size: int = 5,
+        temp_root: str | os.PathLike[str] = TEMP_ROOT,
+    ) -> None:
+        self.device = device
+        self.compute_type = compute_type
+        self.beam_size = beam_size
+        self.temp_root = Path(temp_root).expanduser().resolve()
 
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 2/7 正在进行语音识别..."
-            )
-        )
-
-        logger.info("开始语音识别")
-
-        segments = transcriber.transcribe_chunks(chunks)
-
-        logger.info(
-            f"语音识别完成，共 {len(segments)} 条文本"
-        )
-
-        # =========================================================
-        # 3. 说话人分离
-        # =========================================================
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 3/7 正在进行说话人分离..."
-            )
-        )
-
-        logger.info("开始说话人分离")
-
-        diarization, temp_wav = diarizer.diarize(file_path)
-
-        logger.info("说话人分离完成")
-
-        # =========================================================
-        # 4. 时间对齐
-        # =========================================================
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 4/7 正在对齐时间戳..."
-            )
-        )
-
-        logger.info("开始时间对齐")
-
-        aligned = align_segments(
-            diarization,
-            segments
-        )
-
-        logger.info(
-            f"对齐完成，共 {len(aligned)} 条段落"
-        )
-
-        # =========================================================
-        # 5. 角色识别
-        # =========================================================
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 5/7 正在识别角色..."
-            )
-        )
-
-        logger.info("开始角色识别")
-
-        roles = identify_roles(aligned)
-
-        logger.info("角色识别完成")
-
-        # =========================================================
-        # 6. 导出Word
-        # =========================================================
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 6/7 正在导出Word文档..."
-            )
-        )
-
-        logger.info("开始导出文档")
-
-        output_path = export_word(
-            aligned,
-            roles,
-            OUTPUT_DIR,
-            filename
-        )
-
-        logger.info(f"导出完成: {output_path}")
-
-        # =========================================================
-        # 7. 修正说话人
-        # =========================================================
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 7/7 正在修正说话人..."
-            )
-        )
-
-        logger.info("开始修正说话人")
-
-        merge_speaker_text(output_path)
-
-        logger.info(f"修正完成: {output_path}")
-
-        # =========================================================
-        # 完成
-        # =========================================================
-
-        logger.info("全部处理完成")
-
-        progress.root.after(
-            0,
-            lambda:
-            progress.update(
-                f"[{display_name}] 处理完成"
-            )
-        )
-
-        # ===== 成功提示（主线程）=====
-        progress.root.after(
-            0,
-            lambda:
-            show_success(
-                output_path,
-                log_path
-            )
-        )
-
-    except Exception as e:
-
-        import traceback
-
-        logger.error(
-            "系统运行异常:\n%s",
-            traceback.format_exc()
-        )
-
-        # ===== 主线程弹窗 =====
-        progress.root.after(
-            0,
-            lambda:
-            show_error(str(e))
-        )
-
-    finally:
-
-        # =========================================================
-        # 清理临时文件
-        # =========================================================
-
-        logger.info("开始清理临时文件")
-
+    def analyze_file(
+        self,
+        input_path: str | os.PathLike[str],
+        output_dir: str | os.PathLike[str],
+        *,
+        cancel_event: Event | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> FileAnalysis:
+        source = Path(input_path).expanduser().resolve()
+        destination = Path(output_dir).expanduser().resolve()
+        result = FileAnalysis(source, destination, status="processing")
+        started = time.perf_counter()
+        task_dir: Path | None = None
+        diarizer: Diarizer | None = None
         try:
+            if not source.is_file():
+                raise FileNotFoundError("所选音频文件不存在。")
+            if cancel_event and cancel_event.is_set():
+                raise ProcessingCancelled("已在当前文件开始前取消。")
+            self.temp_root.mkdir(parents=True, exist_ok=True)
+            task_dir = Path(tempfile.mkdtemp(prefix="consult-asr-", dir=self.temp_root)).resolve()
 
-            # ===== 删除 chunks =====
-            for chunk_path, _ in chunks:
+            if progress:
+                progress("正在规范化音频（16 kHz 单声道）…")
+            normalized = normalize_audio(source, task_dir, cancel_event)
+            result.duration_seconds = _duration_seconds(normalized)
 
-                if os.path.exists(chunk_path):
-
-                    os.remove(chunk_path)
-
-                    logger.info(
-                        f"删除chunk: {chunk_path}"
-                    )
-
-            # ===== 删除 wav =====
-            if temp_wav:
-
-                if os.path.exists(temp_wav):
-
-                    os.remove(temp_wav)
-
-                    logger.info(
-                        f"删除临时wav: {temp_wav}"
-                    )
-
-            logger.info("临时文件清理完成")
-
-        except Exception as cleanup_error:
-
-            logger.warning(
-                f"清理临时文件失败: {cleanup_error}"
+            if progress:
+                progress("正在识别中文语音…")
+            transcriber = Transcriber(
+                device=self.device,
+                compute_type=self.compute_type,
+                beam_size=self.beam_size,
             )
+            result.words = transcriber.transcribe(normalized, cancel_event=cancel_event)
+            del transcriber
+            _release_memory()
+
+            if cancel_event and cancel_event.is_set():
+                raise ProcessingCancelled("已在语音识别安全边界取消。")
+            if not result.words:
+                result.status = "no_speech"
+                return result
+
+            if progress:
+                progress("正在区分说话人…")
+            diarizer = Diarizer(device=self.device)
+            diarization = diarizer.diarize(normalized, cancel_event=cancel_event)
+            result.words = align_words(diarization, result.words)
+            result.segments = _merge_turns(result.words)
+            if cancel_event and cancel_event.is_set():
+                raise ProcessingCancelled("已在说话人分离安全边界取消。")
+            result.status = "ready"
+        except ProcessingCancelled as exc:
+            result.status = "cancelled"
+            result.error = _safe_error(exc)
+        except Exception as exc:
+            result.status = "failed"
+            result.error = _safe_error(exc)
+        finally:
+            if diarizer is not None:
+                diarizer.release()
+                del diarizer
+            _release_memory()
+            if task_dir is not None:
+                try:
+                    shutil.rmtree(task_dir)
+                except OSError:
+                    pass
+            result.elapsed_seconds = time.perf_counter() - started
+        return result
+
+    def export_file(
+        self,
+        result: FileAnalysis,
+        *,
+        counselor_speaker: str | None = None,
+    ) -> tuple[Path, Path]:
+        if result.status not in {"ready", "no_speech", "exported", "export_failed"}:
+            raise ValueError("只有识别完成或无语音的文件可以导出。")
+        role_labels: dict[str, str] = {}
+        roles_confirmed = counselor_speaker in {"speaker_1", "speaker_2"} and bool(result.words)
+        if roles_confirmed:
+            other = "speaker_2" if counselor_speaker == "speaker_1" else "speaker_1"
+            role_labels[counselor_speaker] = "咨询师"
+            role_labels[other] = "来访者"
+        try:
+            word_path, json_path = write_exports(
+                words=result.words,
+                output_dir=result.output_dir,
+                filename=result.input_path.stem,
+                source_name=result.input_path.name,
+                duration_seconds=result.duration_seconds,
+                status="no_speech" if not result.words else "success",
+                role_labels=role_labels,
+                roles_confirmed=roles_confirmed,
+            )
+        except Exception as exc:
+            result.status = "export_failed"
+            result.error = _safe_error(exc)
+            raise
+        result.word_path = word_path
+        result.json_path = json_path
+        result.roles_confirmed = roles_confirmed
+        result.counselor_speaker = counselor_speaker if roles_confirmed else None
+        result.status = "exported"
+        result.error = ""
+        return word_path, json_path
 
 
+def _merge_turns(words: list[dict[str, Any]], gap: float = 1.5) -> list[dict[str, Any]]:
+    turns: list[dict[str, Any]] = []
+    for word in words:
+        if (
+            turns
+            and turns[-1]["speaker_id"] == word.get("speaker_id")
+            and float(word["start"]) - turns[-1]["end"] <= gap
+        ):
+            turns[-1]["end"] = max(turns[-1]["end"], float(word["end"]))
+            turns[-1]["text"] += str(word.get("text", ""))
+            turns[-1]["uncertain"] = turns[-1]["uncertain"] or bool(word.get("uncertain", False))
+        else:
+            turns.append({
+                "start": float(word["start"]),
+                "end": float(word["end"]),
+                "text": str(word.get("text", "")),
+                "speaker_id": word.get("speaker_id"),
+                "uncertain": bool(word.get("uncertain", False)),
+            })
+    return turns

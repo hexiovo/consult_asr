@@ -1,12 +1,15 @@
-from app.pipeline import run_single
-from app.pipeline import run_pipeline
-from app.gui import select_mode
+"""Launch the local consultation transcription desktop application."""
+
+
+def main() -> int:
+    try:
+        from app.gui import run_app
+    except ImportError as exc:
+        raise SystemExit(
+            "界面依赖尚未安装。请先按 README.md 创建隔离环境并安装 requirements-lock.txt。"
+        ) from exc
+    return run_app()
+
 
 if __name__ == "__main__":
-    mode = select_mode()
-
-    if mode == 1:
-        input_path = run_single()
-    elif mode == 2:
-        input_path = run_pipeline()
-
+    raise SystemExit(main())
