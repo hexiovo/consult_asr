@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.0.3**
-Updated: 2026-09-30
+Current version: **2.1.0**
+Updated: 2026-10-01
+
+## 2.1.0
+
+- Refresh the PySide6 window with a two-column recording queue and transcript preview, persistent output-path field, compact status badges, and collapsed advanced recognition settings.
+- Show per-file processing states, Chinese speaker labels, and disable result actions when no exportable result is selected.
+- Verify the real Qt window at 1160×760 and 920×640 using only synthetic in-memory results and mocked model readiness; no audio, model weights, network, token, or GPU inference was used.
 
 ## 2.0.3
 

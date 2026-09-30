@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer
-from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase
+from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -135,8 +135,8 @@ class MainWindow(QMainWindow):
         if application is not None:
             _configure_application_fonts(application)
         self.setWindowTitle("咨询录音转写")
-        self.resize(1120, 820)
-        self.setMinimumSize(860, 660)
+        self.resize(1160, 760)
+        self.setMinimumSize(900, 600)
         self.input_files: list[Path] = []
         self.input_root: Path | None = None
         self.analyses: list[FileAnalysis | None] = []
@@ -144,72 +144,223 @@ class MainWindow(QMainWindow):
         self.role_choices: dict[str, str | None] = {}
         self._updating_role = False
         self._close_when_done = False
+        self.setStyleSheet(_window_stylesheet())
 
         central = QWidget()
+        central.setObjectName("centralRoot")
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(22, 18, 22, 18)
-        outer.setSpacing(11)
+        outer.setContentsMargins(18, 14, 18, 14)
+        outer.setSpacing(8)
 
-        title = QLabel("咨询录音转写")
+        header = QHBoxLayout()
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(1)
+        title = QLabel("咨询转写")
         title_font = QFont()
-        title_font.setPointSize(19)
+        title_font.setPointSize(18)
         title_font.setWeight(QFont.Weight.DemiBold)
         title.setFont(title_font)
-        subtitle = QLabel("在本机完成中文转写与双人区分。录音不会上传；先看示例发言，再决定是否标注咨询师/来访者。")
-        subtitle.setWordWrap(True)
-        outer.addWidget(title)
-        outer.addWidget(subtitle)
+        subtitle = QLabel("本地处理 · 中文双人区分 · 录音不会上传")
+        subtitle.setObjectName("mutedLabel")
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        header.addLayout(title_stack)
+        header.addStretch(1)
+        local_badge = QLabel("本地运行")
+        local_badge.setObjectName("smallBadge")
+        language_badge = QLabel("中文 · 双人")
+        language_badge.setObjectName("smallBadge")
+        header.addWidget(local_badge)
+        header.addWidget(language_badge)
+        outer.addLayout(header)
 
         readiness = QHBoxLayout()
+        readiness.setSpacing(7)
         self.asr_ready_label = QLabel()
         self.diarization_ready_label = QLabel()
         readiness.addWidget(self.asr_ready_label)
-        readiness.addSpacing(18)
         readiness.addWidget(self.diarization_ready_label)
         readiness.addStretch(1)
-        refresh_models = QPushButton("刷新模型状态")
+        refresh_models = QPushButton("刷新状态")
+        refresh_models.setObjectName("quietButton")
         refresh_models.clicked.connect(self._refresh_model_state)
         readiness.addWidget(refresh_models)
         outer.addLayout(readiness)
 
-        source_row = QHBoxLayout()
-        self.source_summary = QLabel("尚未选择音频")
-        self.source_summary.setMinimumWidth(300)
-        source_row.addWidget(self.source_summary, 1)
-        self.choose_files_button = QPushButton("选择音频文件…")
+        self.choose_files_button = QPushButton("添加录音")
+        self.choose_files_button.setObjectName("secondaryButton")
         self.choose_files_button.clicked.connect(self._choose_files)
-        self.choose_folder_button = QPushButton("选择音频文件夹…")
+        self.choose_folder_button = QPushButton("添加文件夹")
+        self.choose_folder_button.setObjectName("secondaryButton")
         self.choose_folder_button.clicked.connect(self._choose_folder)
-        self.clear_button = QPushButton("清空")
+        self.clear_button = QPushButton("清空队列")
+        self.clear_button.setObjectName("quietButton")
         self.clear_button.clicked.connect(self._clear_queue)
+
+        queue = QGroupBox("录音队列")
+        queue.setObjectName("surfaceCard")
+        queue_layout = QVBoxLayout(queue)
+        queue_layout.setContentsMargins(12, 17, 12, 10)
+        queue_layout.setSpacing(8)
+        queue_header = QHBoxLayout()
+        queue_header.addStretch(1)
+        self.source_summary = QLabel("0 项")
+        queue_header.addWidget(self.source_summary)
+        queue_layout.addLayout(queue_header)
+        source_row = QHBoxLayout()
+        source_row.setSpacing(6)
         source_row.addWidget(self.choose_files_button)
         source_row.addWidget(self.choose_folder_button)
+        source_row.addStretch(1)
         source_row.addWidget(self.clear_button)
-        outer.addLayout(source_row)
+        queue_layout.addLayout(source_row)
 
-        output_row = QHBoxLayout()
-        output_row.addWidget(QLabel("保存到"))
+        self.queue_empty = QWidget()
+        self.queue_empty.setObjectName("emptyState")
+        self.queue_empty.setMinimumHeight(160)
+        empty_layout = QVBoxLayout(self.queue_empty)
+        empty_layout.setContentsMargins(18, 16, 18, 16)
+        empty_layout.addStretch(1)
+        empty_title = QLabel("还没有录音")
+        empty_title.setObjectName("emptyTitle")
+        empty_desc = QLabel("从上方添加音频文件或文件夹。\n选中的录音和处理状态会显示在这里。")
+        empty_desc.setObjectName("mutedLabel")
+        empty_desc.setWordWrap(True)
+        empty_layout.addWidget(empty_title)
+        empty_layout.addWidget(empty_desc)
+        empty_layout.addStretch(1)
+        queue_layout.addWidget(self.queue_empty, 1)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setObjectName("queueTable")
+        self.table.setHorizontalHeaderLabels(["音频", "状态", "说明"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnHidden(2, True)
+        self.table.itemSelectionChanged.connect(self._show_selected_analysis)
+        self.table.setMinimumHeight(160)
+        self.table.hide()
+        queue_layout.addWidget(self.table, 1)
+        queue_note = QLabel("选择录音后，可在右侧查看逐字稿与角色确认。")
+        queue_note.setObjectName("mutedLabel")
+        queue_note.setWordWrap(True)
+        queue_layout.addWidget(queue_note)
+
+        review = QGroupBox("转写预览")
+        review.setObjectName("surfaceCard")
+        review_layout = QVBoxLayout(review)
+        review_layout.setContentsMargins(12, 17, 12, 10)
+        review_layout.setSpacing(8)
+        review_header = QHBoxLayout()
+        self.selected_file_label = QLabel("尚未选择录音")
+        self.selected_file_label.setObjectName("mutedLabel")
+        self.selected_file_label.setWordWrap(True)
+        review_header.addWidget(self.selected_file_label, 1)
+        review_header.addStretch(1)
+        self.preview_state = QLabel("等待选择")
+        review_header.addWidget(self.preview_state)
+        review_layout.addLayout(review_header)
+
+        example_row = QHBoxLayout()
+        example_row.setSpacing(7)
+        self.speaker1_example = QLabel("说话人1示例：处理后显示该说话人的示例发言。")
+        self.speaker2_example = QLabel("说话人2示例：处理后显示该说话人的示例发言。")
+        for label in (self.speaker1_example, self.speaker2_example):
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+            label.setObjectName("exampleCard")
+        example_row.addWidget(self.speaker1_example, 1)
+        example_row.addWidget(self.speaker2_example, 1)
+        review_layout.addLayout(example_row)
+
+        self.preview = QPlainTextEdit()
+        self.preview.setObjectName("transcriptPreview")
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("处理完成后，这里会显示带时间和说话人标记的逐字稿。")
+        self.preview.setMinimumHeight(112)
+        review_layout.addWidget(self.preview, 1)
+
+        role_row = QHBoxLayout()
+        role_row.addWidget(QLabel("角色确认"))
+        self.role_combo = _SageRoleComboBox()
+        self.role_combo.setObjectName("sageCombo")
+        self.role_combo.addItem("未确认：保留说话人1 / 说话人2", None)
+        self.role_combo.addItem("确认：说话人1是咨询师", "speaker_1")
+        self.role_combo.addItem("确认：说话人2是咨询师", "speaker_2")
+        self.role_combo.currentIndexChanged.connect(self._role_changed)
+        role_row.addWidget(self.role_combo, 1)
+        review_layout.addLayout(role_row)
+
+        result_actions = QHBoxLayout()
+        result_actions.addStretch(1)
+        self.open_word_button = QPushButton("打开 Word")
+        self.open_word_button.setObjectName("secondaryButton")
+        self.open_word_button.clicked.connect(lambda: self._open_selected("word"))
+        self.open_json_button = QPushButton("打开 JSON")
+        self.open_json_button.setObjectName("secondaryButton")
+        self.open_json_button.clicked.connect(lambda: self._open_selected("json"))
+        self.save_button = QPushButton("保存 Word + JSON")
+        self.save_button.setObjectName("primaryButton")
+        self.save_button.setToolTip("保存尚未导出的文件，以及角色设置发生变化的文件。")
+        self.save_button.clicked.connect(self._save_results)
+        result_actions.addWidget(self.open_word_button)
+        result_actions.addWidget(self.open_json_button)
+        result_actions.addWidget(self.save_button)
+        review_layout.addLayout(result_actions)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(7)
+        queue.setMinimumWidth(300)
+        review.setMinimumWidth(420)
+        splitter.addWidget(queue)
+        splitter.addWidget(review)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 6)
+        outer.addWidget(splitter, 1)
+
+        output_row = QWidget()
+        output_row.setObjectName("outputRow")
+        output_layout = QHBoxLayout(output_row)
+        output_layout.setContentsMargins(11, 7, 11, 7)
+        output_layout.setSpacing(7)
+        output_layout.addWidget(QLabel("保存到"))
         self.output_edit = QLineEdit(str(OUTPUT_DIR))
-        output_row.addWidget(self.output_edit, 1)
-        choose_output = QPushButton("选择…")
+        self.output_edit.setToolTip("结果保存到此文件夹；Word 与 JSON 会成对保存。")
+        output_layout.addWidget(self.output_edit, 1)
+        choose_output = QPushButton("更改…")
+        choose_output.setObjectName("secondaryButton")
         choose_output.clicked.connect(self._choose_output)
-        output_row.addWidget(choose_output)
-        outer.addLayout(output_row)
+        output_layout.addWidget(choose_output)
+        outer.addWidget(output_row)
 
         self.advanced_toggle = QPushButton("显示高级识别设置")
+        self.advanced_toggle.setObjectName("quietButton")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.toggled.connect(self._toggle_advanced)
         outer.addWidget(self.advanced_toggle, 0, Qt.AlignmentFlag.AlignLeft)
         self.advanced_panel = QWidget()
+        self.advanced_panel.setObjectName("advancedPanel")
         advanced_layout = QGridLayout(self.advanced_panel)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.setContentsMargins(10, 3, 10, 6)
+        advanced_layout.setHorizontalSpacing(8)
         advanced_layout.addWidget(QLabel("设备"), 0, 0)
-        self.device_combo = QComboBox()
+        self.device_combo = _SageRoleComboBox()
+        self.device_combo.setObjectName("sageCombo")
         self.device_combo.addItem("自动（优先使用可用 GPU）", "auto")
         self.device_combo.addItem("CPU", "cpu")
         advanced_layout.addWidget(self.device_combo, 0, 1)
         advanced_layout.addWidget(QLabel("识别方式"), 0, 2)
-        self.compute_combo = QComboBox()
+        self.compute_combo = _SageRoleComboBox()
+        self.compute_combo.setObjectName("sageCombo")
         self.compute_combo.addItem("质量优先", "float16")
         self.compute_combo.addItem("速度优先", "int8_float16")
         advanced_layout.addWidget(self.compute_combo, 0, 3)
@@ -221,78 +372,29 @@ class MainWindow(QMainWindow):
         self.advanced_panel.setVisible(False)
         outer.addWidget(self.advanced_panel)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["音频", "状态", "说明"])
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.itemSelectionChanged.connect(self._show_selected_analysis)
-        self.table.setMinimumHeight(165)
-        outer.addWidget(self.table, 2)
-
         activity_row = QHBoxLayout()
         self.progress_label = QLabel("正在检查本地模型…")
+        self.progress_label.setObjectName("mutedLabel")
         activity_row.addWidget(self.progress_label, 1)
         self.counts_label = QLabel("待处理 0  ·  完成 0  ·  失败 0  ·  已取消 0")
+        self.counts_label.setObjectName("mutedLabel")
         activity_row.addWidget(self.counts_label)
         outer.addLayout(activity_row)
         self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("thinProgress")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
         outer.addWidget(self.progress_bar)
-
-        review = QGroupBox("转写预览与角色确认")
-        review_layout = QVBoxLayout(review)
-        example_row = QHBoxLayout()
-        self.speaker1_example = QLabel("说话人1示例：—")
-        self.speaker2_example = QLabel("说话人2示例：—")
-        for label in (self.speaker1_example, self.speaker2_example):
-            label.setWordWrap(True)
-            label.setMinimumWidth(200)
-            label.setStyleSheet("padding: 7px; background: #f3f6f5; border-radius: 5px;")
-        example_row.addWidget(self.speaker1_example, 1)
-        example_row.addWidget(self.speaker2_example, 1)
-        review_layout.addLayout(example_row)
-
-        role_row = QHBoxLayout()
-        role_row.addWidget(QLabel("所选录音的角色"))
-        self.role_combo = QComboBox()
-        self.role_combo.addItem("保留说话人1 / 说话人2", None)
-        self.role_combo.addItem("确认：说话人1是咨询师", "speaker_1")
-        self.role_combo.addItem("确认：说话人2是咨询师", "speaker_2")
-        self.role_combo.currentIndexChanged.connect(self._role_changed)
-        role_row.addWidget(self.role_combo, 1)
-        self.save_button = QPushButton("保存结果（Word + JSON）")
-        self.save_button.setToolTip("保存尚未导出的文件，以及角色设置发生变化的文件。")
-        self.save_button.clicked.connect(self._save_results)
-        role_row.addWidget(self.save_button)
-        review_layout.addLayout(role_row)
-
-        self.preview = QPlainTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setPlaceholderText("处理完成后，这里会显示逐字稿和需要核对的片段。")
-        self.preview.setMinimumHeight(170)
-        review_layout.addWidget(self.preview)
-        open_row = QHBoxLayout()
-        self.open_word_button = QPushButton("打开所选 Word")
-        self.open_word_button.clicked.connect(lambda: self._open_selected("word"))
-        self.open_json_button = QPushButton("打开所选 JSON")
-        self.open_json_button.clicked.connect(lambda: self._open_selected("json"))
-        open_row.addStretch(1)
-        open_row.addWidget(self.open_word_button)
-        open_row.addWidget(self.open_json_button)
-        review_layout.addLayout(open_row)
-        outer.addWidget(review, 3)
 
         action_row = QHBoxLayout()
         action_row.addStretch(1)
         self.start_button = QPushButton("开始处理")
+        self.start_button.setObjectName("primaryButton")
         self.start_button.setDefault(True)
         self.start_button.clicked.connect(self._start)
         self.cancel_button = QPushButton("安全取消")
+        self.cancel_button.setObjectName("secondaryButton")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self._cancel)
         action_row.addWidget(self.cancel_button)
@@ -300,6 +402,9 @@ class MainWindow(QMainWindow):
         outer.addLayout(action_row)
 
         self.setCentralWidget(central)
+        _set_status_badge(self.source_summary, "0 项", "muted")
+        _set_status_badge(self.preview_state, "等待选择", "muted")
+        self._show_selected_analysis()
         self._refresh_model_state()
         self._update_counts()
 
@@ -312,17 +417,19 @@ class MainWindow(QMainWindow):
             "pyannote" in problem.casefold() for problem in problems
         )
         models_ready = asr_ready and diarization_ready
-        self.asr_ready_label.setText(
-            f"large-v3：{'已就绪' if asr_ready else '未准备'}"
-        )
-        self.diarization_ready_label.setText(
-            f"双人区分模型：{'已就绪' if diarization_ready else '未准备'}"
-        )
+        diarization_text = f"双人区分模型：{'已就绪' if diarization_ready else '未准备'}"
         self.asr_ready_label.setToolTip(str(ASR_MODEL_DIR))
         self.diarization_ready_label.setToolTip(str(DIARIZATION_MODEL_DIR))
-        color = "#25633d" if asr_ready and diarization_ready else "#8a5a14"
-        self.asr_ready_label.setStyleSheet(f"color: {color};")
-        self.diarization_ready_label.setStyleSheet(f"color: {color};")
+        _set_status_badge(
+            self.asr_ready_label,
+            f"large-v3：{'已就绪' if asr_ready else '未准备'}",
+            "ready" if asr_ready else "warning",
+        )
+        _set_status_badge(
+            self.diarization_ready_label,
+            diarization_text,
+            "ready" if diarization_ready else "warning",
+        )
         if not (self.worker and self.worker.isRunning()):
             self.start_button.setEnabled(models_ready)
             if not preserve_status:
@@ -365,14 +472,21 @@ class MainWindow(QMainWindow):
         self.role_choices.clear()
         self.table.setRowCount(len(unique))
         for row, path in enumerate(unique):
-            self.table.setItem(row, 0, QTableWidgetItem(path.name))
-            self.table.setItem(row, 1, QTableWidgetItem("待处理"))
-            self.table.setItem(row, 2, QTableWidgetItem(str(path.parent)))
-        self.source_summary.setText(f"已选择 {len(unique)} 个音频文件")
+            name_item = QTableWidgetItem(path.name)
+            name_item.setToolTip(str(path))
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, QTableWidgetItem())
+            self.table.setItem(row, 2, QTableWidgetItem())
+            self._set_queue_status(row, "pending", "待处理")
+            self._set_queue_detail(row, "尚未处理")
+        self.source_summary.setText(f"{len(unique)} 项")
+        self.queue_empty.setVisible(not unique)
+        self.table.setVisible(bool(unique))
         if unique:
             self.table.selectRow(0)
         self.preview.clear()
         self._update_counts()
+        self._show_selected_analysis()
 
     def _clear_queue(self):
         if self.worker and self.worker.isRunning():
@@ -381,9 +495,12 @@ class MainWindow(QMainWindow):
         self.input_root = None
         self.analyses = []
         self.table.setRowCount(0)
-        self.source_summary.setText("尚未选择音频")
+        self.source_summary.setText("0 项")
+        self.queue_empty.show()
+        self.table.hide()
         self.preview.clear()
         self._update_counts()
+        self._show_selected_analysis()
 
     def _choose_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.output_edit.text())
@@ -419,8 +536,8 @@ class MainWindow(QMainWindow):
         self.analyses = [None] * len(self.input_files)
         self.role_choices.clear()
         for row in range(len(self.input_files)):
-            self.table.item(row, 1).setText("待处理")
-            self.table.item(row, 2).setText(str(self.input_files[row].parent))
+            self._set_queue_status(row, "pending", "待处理")
+            self._set_queue_detail(row, "尚未处理")
         device_choice = self.device_combo.currentData() if self.advanced_toggle.isChecked() else "auto"
         compute_type = self.compute_combo.currentData() if self.advanced_toggle.isChecked() else "float16"
         beam_size = self.beam_spin.value() if self.advanced_toggle.isChecked() else 5
@@ -452,25 +569,57 @@ class MainWindow(QMainWindow):
     def _progress(self, current, total, message):
         self.progress_label.setText(message)
         self.progress_bar.setValue(int((current - 1) / max(total, 1) * 100))
+        row = current - 1
+        if 0 <= row < len(self.analyses) and self.analyses[row] is None:
+            detail = message.split("] ", 1)[-1]
+            self._set_queue_status(row, "processing", "处理中")
+            self._set_queue_detail(row, detail)
+            if self.table.currentRow() == row:
+                _set_status_badge(self.preview_state, "处理中", "processing")
+                self.preview.setPlainText(detail)
 
     def _analysis_ready(self, row: int, result: FileAnalysis):
         if row < 0 or row >= len(self.analyses):
             return
         self.analyses[row] = result
-        status_text = {
-            "ready": "识别完成，待导出",
-            "no_speech": "未检测到语音",
-            "failed": "失败",
-            "export_failed": "导出失败",
-            "cancelled": "已取消",
-            "exported": "已导出",
-        }.get(result.status, result.status)
-        self.table.item(row, 1).setText(status_text)
+        status_text, tone = _file_status(result.status)
+        self._set_queue_status(row, tone, status_text)
         detail = result.error or f"{len(result.words)} 个时间片段 · {result.elapsed_seconds:.1f} 秒"
-        self.table.item(row, 2).setText(detail)
+        self._set_queue_detail(row, detail)
         self._update_counts()
         if self.table.currentRow() == row:
             self._show_selected_analysis()
+
+    def _set_queue_status(self, row: int, tone: str, text: str):
+        item = self.table.item(row, 1)
+        if item is None:
+            return
+        colors = {
+            "pending": ("#6e7c72", "#f0f2ef"),
+            "processing": ("#816320", "#f8f0dc"),
+            "ready": ("#38654f", "#e8f1e9"),
+            "no_speech": ("#6e7c72", "#f0f2ef"),
+            "exported": ("#38654f", "#e8f1e9"),
+            "failed": ("#9a433c", "#f8e9e6"),
+            "export_failed": ("#9a433c", "#f8e9e6"),
+            "cancelled": ("#6e7c72", "#f0f2ef"),
+        }
+        foreground, background = colors.get(tone, colors["pending"])
+        item.setText(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setForeground(QColor(foreground))
+        item.setBackground(QColor(background))
+
+    def _set_queue_detail(self, row: int, text: str):
+        detail_item = self.table.item(row, 2)
+        if detail_item is None:
+            return
+        detail_item.setText(text)
+        path = self.input_files[row]
+        for column in (0, 1):
+            item = self.table.item(row, column)
+            if item is not None:
+                item.setToolTip(f"{text}\n{path}")
 
     def _finished(self):
         self.cancel_button.setEnabled(False)
@@ -515,14 +664,31 @@ class MainWindow(QMainWindow):
         self.open_word_button.setEnabled(False)
         self.open_json_button.setEnabled(False)
         if row < 0 or row >= len(self.analyses):
+            self.selected_file_label.setText("尚未选择录音")
+            self._updating_role = True
+            self.role_combo.setCurrentIndex(0)
+            self._updating_role = False
+            _set_status_badge(self.preview_state, "等待选择", "muted")
+            self.preview.setPlainText("从左侧队列选择一条录音；处理完成后，这里会显示逐字稿和角色确认。")
             return
+        self.selected_file_label.setText(self.input_files[row].name)
+        self.selected_file_label.setToolTip(str(self.input_files[row]))
         result = self.analyses[row]
         self._updating_role = True
         self.role_combo.setCurrentIndex(0)
         self._updating_role = False
         if result is None:
-            self.preview.setPlainText("该文件尚未处理。")
+            status_item = self.table.item(row, 1)
+            detail_item = self.table.item(row, 2)
+            status_text = status_item.text() if status_item is not None else "待处理"
+            detail_text = detail_item.text() if detail_item is not None else ""
+            tone = "processing" if status_text == "处理中" else "pending"
+            _set_status_badge(self.preview_state, status_text, tone)
+            self.preview.setPlainText(detail_text or "该文件尚未处理。")
             return
+
+        status_text, tone = _file_status(result.status)
+        _set_status_badge(self.preview_state, status_text, tone)
 
         choice = self.role_choices.get(str(result.input_path))
         for index in range(self.role_combo.count()):
@@ -545,7 +711,8 @@ class MainWindow(QMainWindow):
                 lines.extend(["", "已保留识别文本（说话人区分未完成）："])
                 for item in result.words:
                     start = max(0, int(item.get("start", 0)))
-                    lines.append(f"[{start // 60:02d}:{start % 60:02d}] {item.get('text', '')}")
+                    speaker = _speaker_label(item.get("speaker_id"))
+                    lines.append(f"[{start // 60:02d}:{start % 60:02d}] {speaker}：{item.get('text', '')}")
             self.preview.setPlainText("\n".join(lines))
         elif result.status == "cancelled":
             self.preview.setPlainText("处理已取消\n" + result.error)
@@ -554,9 +721,9 @@ class MainWindow(QMainWindow):
         elif result.words:
             lines = []
             for item in result.segments:
-                start = max(0, int(item["start"]))
+                start = max(0, int(float(item["start"])))
                 timestamp = f"[{start // 60:02d}:{start % 60:02d}]"
-                speaker = item.get("speaker_id") or "说话人待确认"
+                speaker = _speaker_label(item.get("speaker_id"))
                 mark = " 〔待核对〕" if item.get("uncertain") else ""
                 lines.append(f"{timestamp} {speaker}：{item['text']}{mark}")
             self.preview.setPlainText("\n".join(lines))
@@ -586,15 +753,15 @@ class MainWindow(QMainWindow):
             speaker = self.role_choices.get(str(result.input_path))
             try:
                 word_path, json_path = pipeline.export_file(result, counselor_speaker=speaker)
-                self.table.item(index, 1).setText("已导出")
-                self.table.item(index, 2).setText(f"Word + JSON 已保存：{word_path.name}")
+                self._set_queue_status(index, "exported", "已导出")
+                self._set_queue_detail(index, f"Word + JSON 已保存：{word_path.name}")
                 saved += 1
             except Exception as exc:
                 result.status = "export_failed"
                 result.error = str(exc)[:500]
                 errors.append(f"{result.input_path.name}：{result.error[:300]}")
-                self.table.item(index, 1).setText("导出失败")
-                self.table.item(index, 2).setText(result.error)
+                self._set_queue_status(index, "export_failed", "导出失败")
+                self._set_queue_detail(index, result.error)
         self._update_counts()
         self._show_selected_analysis()
         message = f"已保存 {saved} 个 Word + JSON 结果。"
@@ -642,6 +809,177 @@ def run_app() -> int:
     window = MainWindow()
     window.show()
     return app.exec()
+
+
+def _file_status(status: str) -> tuple[str, str]:
+    return {
+        "ready": ("识别完成，待导出", "ready"),
+        "no_speech": ("未检测到语音", "no_speech"),
+        "failed": ("失败", "failed"),
+        "export_failed": ("导出失败", "export_failed"),
+        "cancelled": ("已取消", "cancelled"),
+        "exported": ("已导出", "exported"),
+    }.get(status, (status or "未知状态", "pending"))
+
+
+def _speaker_label(speaker_id: str | None) -> str:
+    return {
+        "speaker_1": "说话人1",
+        "speaker_2": "说话人2",
+    }.get(speaker_id, "说话人待确认" if not speaker_id else speaker_id)
+
+
+def _set_status_badge(label: QLabel, text: str, tone: str) -> None:
+    colors = {
+        "ready": ("#38654f", "#e8f1e9", "#d7e6d9"),
+        "warning": ("#80601d", "#f7efd9", "#eadcb7"),
+        "processing": ("#816320", "#f8f0dc", "#eadcb7"),
+        "pending": ("#69776d", "#f0f2ef", "#e3e7e2"),
+        "muted": ("#69776d", "#f0f2ef", "#e3e7e2"),
+        "failed": ("#98453d", "#f8e9e6", "#efd4cf"),
+        "export_failed": ("#98453d", "#f8e9e6", "#efd4cf"),
+        "cancelled": ("#69776d", "#f0f2ef", "#e3e7e2"),
+        "no_speech": ("#69776d", "#f0f2ef", "#e3e7e2"),
+        "exported": ("#38654f", "#e8f1e9", "#d7e6d9"),
+    }
+    foreground, background, border = colors.get(tone, colors["muted"])
+    label.setText(text)
+    label.setStyleSheet(
+        "QLabel {"
+        f"color: {foreground}; background: {background}; border: 1px solid {border};"
+        "border-radius: 10px; padding: 3px 8px;"
+        "}"
+    )
+
+
+class _SageRoleComboBox(QComboBox):
+    """Paint a small local triangle over the Qt combo box drop-down area."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        center_x = self.width() - 12
+        center_y = self.height() // 2
+        triangle = QPolygon(
+            [
+                QPoint(center_x - 4, center_y - 2),
+                QPoint(center_x + 4, center_y - 2),
+                QPoint(center_x, center_y + 3),
+            ]
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#748177"))
+        painter.drawPolygon(triangle)
+
+
+def _window_stylesheet() -> str:
+    return """
+    QMainWindow, QWidget#centralRoot {
+        background: #f5f5f0;
+        color: #293a32;
+    }
+    QLabel { color: #293a32; }
+    QLabel#mutedLabel { color: #748177; }
+    QLabel#smallBadge {
+        color: #65766b;
+        background: #eef2ed;
+        border: 1px solid #e0e6de;
+        border-radius: 10px;
+        padding: 4px 8px;
+    }
+    QLabel#emptyTitle { font-size: 12pt; font-weight: 600; }
+    QLabel#exampleCard {
+        color: #53655b;
+        background: #f4f7f3;
+        border: 1px solid #e4eae2;
+        border-radius: 9px;
+        padding: 8px;
+    }
+    QGroupBox#surfaceCard {
+        background: #fffefa;
+        border: 1px solid #e0e6df;
+        border-radius: 13px;
+        margin-top: 7px;
+        font-weight: 600;
+    }
+    QGroupBox#surfaceCard::title {
+        subcontrol-origin: margin;
+        left: 13px;
+        padding: 0 4px;
+        color: #52645a;
+    }
+    QWidget#emptyState {
+        background: #f7f8f4;
+        border: 1px solid #eef0eb;
+        border-radius: 10px;
+    }
+    QWidget#outputRow {
+        background: #fffefa;
+        border: 1px solid #e0e6df;
+        border-radius: 10px;
+    }
+    QPushButton {
+        color: #34483d;
+        background: #fffefa;
+        border: 1px solid #d8e1d8;
+        border-radius: 8px;
+        padding: 6px 11px;
+        min-height: 19px;
+    }
+    QPushButton:hover { background: #f1f6f1; border-color: #b9cdbd; }
+    QPushButton:pressed { background: #e8f0e8; }
+    QPushButton:disabled { color: #96a197; background: #edf0ec; border-color: #e4e8e3; }
+    QPushButton#primaryButton {
+        color: #ffffff;
+        background: #386c55;
+        border: 1px solid #386c55;
+        font-weight: 600;
+    }
+    QPushButton#primaryButton:hover { background: #2f614b; border-color: #2f614b; }
+    QPushButton#primaryButton:disabled { color: #8c9990; background: #dfe7e0; border-color: #dfe7e0; }
+    QPushButton#quietButton { background: transparent; border-color: transparent; color: #62756a; }
+    QPushButton#quietButton:hover { background: #edf2ed; border-color: #e2e9e1; }
+    QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTableWidget {
+        color: #293a32;
+        background: #ffffff;
+        border: 1px solid #dce4dc;
+        border-radius: 8px;
+        selection-background-color: #dcebe0;
+        padding: 5px 7px;
+    }
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus {
+        border-color: #8fae97;
+    }
+    QComboBox::drop-down {
+        subcontrol-origin: padding;
+        subcontrol-position: top right;
+        width: 24px;
+        border: none;
+    }
+    QComboBox#sageCombo::down-arrow { image: none; width: 0px; height: 0px; }
+    QTableWidget { padding: 2px; alternate-background-color: #fbfcf9; }
+    QHeaderView::section {
+        color: #728177;
+        background: #f7f9f6;
+        border: none;
+        border-bottom: 1px solid #e5eae4;
+        padding: 5px 6px;
+        font-weight: 600;
+    }
+    QTableWidget::item { border-bottom: 1px solid #eef1ec; padding: 5px; }
+    QTableWidget::item:selected { background: #e8f1e9; color: #293a32; }
+    QPlainTextEdit#transcriptPreview { padding: 9px; }
+    QSplitter::handle { background: transparent; }
+    QProgressBar#thinProgress {
+        background: #e9eee8;
+        border: none;
+        border-radius: 4px;
+        max-height: 8px;
+        text-visible: false;
+    }
+    QProgressBar#thinProgress::chunk { background: #7da087; border-radius: 4px; }
+    """
 
 
 def _configure_application_fonts(app: QApplication) -> None:
