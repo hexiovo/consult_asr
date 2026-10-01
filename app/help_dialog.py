@@ -2,13 +2,15 @@
 
 from pathlib import Path
 
-from PySide6.QtGui import QTextCursor
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QTextBrowser,
     QVBoxLayout,
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
 
 
 GUIDE_PATH = Path(__file__).resolve().parents[1] / "USER_GUIDE.md"
+PDF_GUIDE_PATH = GUIDE_PATH.parent / "output" / "pdf" / "咨询录音转写_图文使用指南.pdf"
 
 
 class UserGuideDialog(QDialog):
@@ -60,12 +63,26 @@ class UserGuideDialog(QDialog):
         self.search_status = QLabel()
         self.search_status.setObjectName("mutedLabel")
         footer.addWidget(self.search_status, 1)
+        self.pdf_button = QPushButton("打开 PDF 指南")
+        self.pdf_button.setAutoDefault(False)
+        self.pdf_button.clicked.connect(self._open_pdf)
+        footer.addWidget(self.pdf_button)
         close_button = QPushButton("关闭指南")
         close_button.setAutoDefault(False)
         close_button.clicked.connect(self.close)
         footer.addWidget(close_button)
         layout.addLayout(footer)
         self.reload_guide()
+
+    def _open_pdf(self):
+        if not PDF_GUIDE_PATH.is_file():
+            QMessageBox.information(
+                self, "PDF 指南缺失", "请保留 output/pdf 中的图文使用指南 PDF，或继续阅读本窗口的文字指南。"
+            )
+        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(PDF_GUIDE_PATH))):
+            QMessageBox.warning(
+                self, "无法打开 PDF", "系统未能打开 PDF，请使用本地 PDF 阅读器打开 output/pdf 中的图文使用指南。"
+            )
 
     def reload_guide(self):
         self.sections.blockSignals(True)

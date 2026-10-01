@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.3.1**
+Current version: **2.3.2**
 Updated: 2026-10-02
+
+## 2.3.2
+
+- Add an illustrated PDF user guide with actual Qt interface captures populated only with synthetic examples and explicitly labeled demonstration states.
+- Add a local PDF entry in the existing guide window, retaining searchable text help and readable missing-file/open-failure messages.
+- Verify the 16-page PDF with eight screenshots, embedded Chinese text, clickable contents/bookmarks and rendered page inspection; test the local PDF opener without private recordings or model inference.
 
 ## 2.3.1
 
