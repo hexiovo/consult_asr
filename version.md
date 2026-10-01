@@ -1,7 +1,12 @@
 # Version
 
-Current version: **2.3.0**
-Updated: 2026-10-01
+Current version: **2.3.1**
+Updated: 2026-10-02
+
+## 2.3.1
+
+- Add a complete Chinese user guide covering deployment, models, transcription, timing, playback/correction, roles, paired exports, recovery, local files and troubleshooting.
+- Add an always-available UI guide button with a nonmodal local reader, chapter navigation and text search; read the same USER_GUIDE.md shipped with the project and show a recoverable message if it is missing.
 
 ## 2.3.0
 

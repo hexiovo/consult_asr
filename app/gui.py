@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.help_dialog import UserGuideDialog
 from app.pipeline import ConsultationPipeline, FileAnalysis
 from config import (
     ASR_MODEL_DIR,
@@ -298,6 +299,7 @@ class MainWindow(QMainWindow):
         self.input_root: Path | None = None
         self.analyses: list[FileAnalysis | None] = []
         self.worker: ProcessingWorker | None = None
+        self._guide_dialog: UserGuideDialog | None = None
         self.role_choices: dict[str, str | None] = {}
         self._updating_role = False
         self._close_when_done = False
@@ -372,6 +374,11 @@ class MainWindow(QMainWindow):
         language_badge.setObjectName("smallBadge")
         header.addWidget(local_badge)
         header.addWidget(language_badge)
+        self.guide_button = QPushButton("使用指南")
+        self.guide_button.setObjectName("quietButton")
+        self.guide_button.setToolTip("查看本地指南：部署、转录、校对、导出、恢复与故障排查。")
+        self.guide_button.clicked.connect(self._show_user_guide)
+        header.addWidget(self.guide_button)
         outer.addLayout(header)
 
         readiness = QHBoxLayout()
@@ -674,6 +681,15 @@ class MainWindow(QMainWindow):
         self._refresh_model_state()
         self._update_counts()
         self._restore_session()
+
+    def _show_user_guide(self):
+        if self._guide_dialog is None:
+            self._guide_dialog = UserGuideDialog(self)
+        else:
+            self._guide_dialog.reload_guide()
+        self._guide_dialog.show()
+        self._guide_dialog.raise_()
+        self._guide_dialog.activateWindow()
 
     def _reset_time_estimate(self):
         self._timing_timer.stop()

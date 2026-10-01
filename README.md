@@ -2,6 +2,8 @@
 
 Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使用 pyannote.audio 区分两位说话人，并可用 emotion2vec 展示语音情绪倾向和声学特征。保存前可预览文本并确认角色；音频与转写只在本机处理。
 
+完整操作说明见 [使用指南](USER_GUIDE.md)。也可点击界面右上角“使用指南”，在本地窗口按章节跳转或搜索；录音处理中仍可查看。
+
 ## 启动
 
 1. 创建独立的 `consult_asr_fast` Python 3.10 环境，并按锁定清单安装依赖：
@@ -17,7 +19,7 @@ Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使�
 2. 准备本地模型：
 
    ```powershell
-   python tools/prepare_models.py
+   python tools/prepare_models.py --prompt-token
    python tools/prepare_models.py --tone
    python tools/prepare_models.py --verify
    ```
