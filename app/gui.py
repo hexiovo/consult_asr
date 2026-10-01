@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPaint
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -30,7 +31,14 @@ from PySide6.QtWidgets import (
 )
 
 from app.pipeline import ConsultationPipeline, FileAnalysis
-from config import ASR_MODEL_DIR, DIARIZATION_MODEL_DIR, OUTPUT_DIR
+from config import (
+    ASR_MODEL_DIR,
+    DIARIZATION_MODEL_DIR,
+    OUTPUT_DIR,
+    TONE_DEFAULT_ENABLED,
+    TONE_MODEL_DIR,
+    TONE_RUNTIME_DIR,
+)
 from core.diarizer import Diarizer
 from core.transcriber import Transcriber
 from tools.prepare_models import verify_models
@@ -41,7 +49,7 @@ class ProcessingWorker(QThread):
     progress = Signal(int, int, str)
     analysis_ready = Signal(int, object)
 
-    def __init__(self, files, input_root, output_root, device_choice, compute_type, beam_size):
+    def __init__(self, files, input_root, output_root, device_choice, compute_type, beam_size, tone_enabled=None):
         super().__init__()
         self.files = list(files)
         self.input_root = Path(input_root).resolve() if input_root else None
@@ -49,6 +57,7 @@ class ProcessingWorker(QThread):
         self.device_choice = device_choice
         self.compute_type = compute_type
         self.beam_size = beam_size
+        self.tone_enabled = tone_enabled
         self.cancel_event = Event()
 
     def cancel(self):
@@ -74,6 +83,7 @@ class ProcessingWorker(QThread):
                 device=device,
                 compute_type=compute_type,
                 beam_size=self.beam_size,
+                tone_enabled=self.tone_enabled,
             )
             total = len(self.files)
             for index, path in enumerate(self.files, 1):
@@ -178,8 +188,17 @@ class MainWindow(QMainWindow):
         readiness.setSpacing(7)
         self.asr_ready_label = QLabel()
         self.diarization_ready_label = QLabel()
+        self.tone_ready_label = QLabel()
         readiness.addWidget(self.asr_ready_label)
         readiness.addWidget(self.diarization_ready_label)
+        readiness.addWidget(self.tone_ready_label)
+        self.tone_enabled_check = QCheckBox("情绪倾向分析")
+        self.tone_enabled_check.setChecked(TONE_DEFAULT_ENABLED)
+        self.tone_enabled_check.setToolTip(
+            "默认使用本地 emotion2vec 模型；取消勾选会关闭情绪倾向分析，但仍会继续转写和安全窗口声学特征分析。"
+        )
+        self.tone_enabled_check.toggled.connect(lambda _checked: self._refresh_model_state())
+        readiness.addWidget(self.tone_enabled_check)
         readiness.addStretch(1)
         refresh_models = QPushButton("刷新状态")
         refresh_models.setObjectName("quietButton")
@@ -416,10 +435,23 @@ class MainWindow(QMainWindow):
         diarization_ready = Diarizer().is_ready and not any(
             "pyannote" in problem.casefold() for problem in problems
         )
-        models_ready = asr_ready and diarization_ready
+        try:
+            from core.emotion import check_emotion_assets
+
+            tone_assets = check_emotion_assets(TONE_MODEL_DIR, TONE_RUNTIME_DIR)
+            tone_ready = bool(tone_assets.get("ready"))
+            tone_reason = str(tone_assets.get("reason") or "本地 emotion2vec 资源已就绪。")
+        except Exception as exc:
+            tone_ready = False
+            tone_reason = f"情绪模型状态不可用：{type(exc).__name__}: {str(exc)[:300]}"
+        tone_enabled = self.tone_enabled_check.isChecked()
+        models_ready = asr_ready and diarization_ready and (tone_ready or not tone_enabled)
+        self._core_models_ready = asr_ready and diarization_ready
         diarization_text = f"双人区分模型：{'已就绪' if diarization_ready else '未准备'}"
         self.asr_ready_label.setToolTip(str(ASR_MODEL_DIR))
         self.diarization_ready_label.setToolTip(str(DIARIZATION_MODEL_DIR))
+        self.tone_ready_label.setToolTip(f"{TONE_MODEL_DIR}\n{tone_reason}")
+        self._tone_ready = tone_ready
         _set_status_badge(
             self.asr_ready_label,
             f"large-v3：{'已就绪' if asr_ready else '未准备'}",
@@ -430,14 +462,20 @@ class MainWindow(QMainWindow):
             diarization_text,
             "ready" if diarization_ready else "warning",
         )
+        _set_status_badge(
+            self.tone_ready_label,
+            f"emotion2vec：{'已就绪' if tone_ready else '未准备'}",
+            "ready" if tone_ready else "warning",
+        )
         if not (self.worker and self.worker.isRunning()):
             self.start_button.setEnabled(models_ready)
             if not preserve_status:
-                self.progress_label.setText(
-                    "本地模型已齐全，可以开始处理。"
-                    if models_ready
-                    else "本地模型未齐全；准备完成后请刷新模型状态。"
-                )
+                if models_ready:
+                    self.progress_label.setText("本地模型已齐全，可以开始处理。")
+                elif tone_enabled and asr_ready and diarization_ready:
+                    self.progress_label.setText("情绪模型未准备；运行 python tools/prepare_models.py --tone，或关闭情绪分析。")
+                else:
+                    self.progress_label.setText("本地模型未齐全；准备完成后请刷新模型状态。")
 
     def _toggle_advanced(self, checked: bool):
         self.advanced_panel.setVisible(checked)
@@ -512,10 +550,18 @@ class MainWindow(QMainWindow):
             return
         self._refresh_model_state()
         if not self.start_button.isEnabled():
+            if (
+                getattr(self, "_core_models_ready", False)
+                and self.tone_enabled_check.isChecked()
+                and not getattr(self, "_tone_ready", False)
+            ):
+                message = "请运行 python tools/prepare_models.py --tone 准备情绪模型，或取消勾选“情绪倾向分析”。"
+            else:
+                message = "请先准备 large-v3 与 pyannote 双人区分模型，再刷新模型状态。"
             QMessageBox.information(
                 self,
                 "本地模型未齐全",
-                "请先准备 large-v3 与 pyannote 双人区分模型，再刷新模型状态。",
+                message,
             )
             return
         if not self.input_files:
@@ -548,11 +594,13 @@ class MainWindow(QMainWindow):
             device_choice,
             compute_type,
             beam_size,
+            self.tone_enabled_check.isChecked(),
         )
         self.worker.progress.connect(self._progress)
         self.worker.analysis_ready.connect(self._analysis_ready)
         self.worker.finished.connect(self._finished)
         self.start_button.setEnabled(False)
+        self.tone_enabled_check.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.choose_files_button.setEnabled(False)
         self.choose_folder_button.setEnabled(False)
@@ -582,9 +630,11 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.analyses):
             return
         self.analyses[row] = result
-        status_text, tone = _file_status(result.status)
+        status_text, tone = _analysis_status(result)
         self._set_queue_status(row, tone, status_text)
         detail = result.error or f"{len(result.words)} 个时间片段 · {result.elapsed_seconds:.1f} 秒"
+        if result.tone_status in {"failed", "partial"} and result.tone_error:
+            detail += f" · 情绪分析：{result.tone_error[:180]}"
         self._set_queue_detail(row, detail)
         self._update_counts()
         if self.table.currentRow() == row:
@@ -597,6 +647,7 @@ class MainWindow(QMainWindow):
         colors = {
             "pending": ("#6e7c72", "#f0f2ef"),
             "processing": ("#816320", "#f8f0dc"),
+            "warning": ("#80601d", "#f7efd9"),
             "ready": ("#38654f", "#e8f1e9"),
             "no_speech": ("#6e7c72", "#f0f2ef"),
             "exported": ("#38654f", "#e8f1e9"),
@@ -625,6 +676,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.choose_files_button.setEnabled(True)
         self.choose_folder_button.setEnabled(True)
+        self.tone_enabled_check.setEnabled(True)
         self.progress_bar.setValue(100)
         cancelled = bool(self.worker and self.worker.cancel_event.is_set())
         self._update_counts()
@@ -687,7 +739,7 @@ class MainWindow(QMainWindow):
             self.preview.setPlainText(detail_text or "该文件尚未处理。")
             return
 
-        status_text, tone = _file_status(result.status)
+        status_text, tone = _analysis_status(result)
         _set_status_badge(self.preview_state, status_text, tone)
 
         choice = self.role_choices.get(str(result.input_path))
@@ -726,6 +778,38 @@ class MainWindow(QMainWindow):
                 speaker = _speaker_label(item.get("speaker_id"))
                 mark = " 〔待核对〕" if item.get("uncertain") else ""
                 lines.append(f"{timestamp} {speaker}：{item['text']}{mark}")
+            if result.tone_enabled is not None:
+                lines.extend(["", "语音特征"])
+                for window in result.analysis_windows:
+                    features = _format_acoustic_features(window.get("acoustics"))
+                    start = max(0, int(float(window.get("start", 0))))
+                    end = max(0, int(float(window.get("end", 0))))
+                    timestamp = f"[{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}]"
+                    speaker = _speaker_label(window.get("speaker_id"))
+                    if features:
+                        lines.append(f"{timestamp} {speaker}：{features}")
+                    elif not window.get("analysis_safe"):
+                        lines.append(
+                            f"{timestamp} {speaker}：声学特征未知（{_emotion_reason_zh(window.get('reason'))}）"
+                        )
+                if result.tone_enabled is False:
+                    lines.append("情绪倾向分析：已关闭。")
+                else:
+                    if result.tone_status in {"failed", "partial"}:
+                        state = "部分失败" if result.tone_status == "partial" else "失败"
+                        lines.append(f"情绪倾向分析：{state}。{result.tone_error}")
+                    lines.append("情绪趋势（模型置信分数为未校准原始输出）")
+                    for window in result.analysis_windows:
+                        start = max(0, int(float(window.get("start", 0))))
+                        end = max(0, int(float(window.get("end", 0))))
+                        speaker = _speaker_label(window.get("speaker_id"))
+                        if window.get("status") == "ok":
+                            label = _emotion_label_zh(str(window.get("label") or "unknown"))
+                            score = window.get("model_score")
+                            detail = f"{label} · 模型置信分数 {float(score):.3f}" if isinstance(score, (int, float)) else label
+                        else:
+                            detail = f"未知（{_emotion_reason_zh(window.get('reason'))}）"
+                        lines.append(f"[{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}] {speaker}：{detail}")
             self.preview.setPlainText("\n".join(lines))
         else:
             self.preview.setPlainText("没有可预览的转写内容。")
@@ -822,11 +906,80 @@ def _file_status(status: str) -> tuple[str, str]:
     }.get(status, (status or "未知状态", "pending"))
 
 
+def _analysis_status(result: FileAnalysis) -> tuple[str, str]:
+    status, tone = _file_status(result.status)
+    if result.status in {"ready", "exported"}:
+        if result.tone_status == "failed":
+            return ("转写完成，情绪分析失败" if result.status == "ready" else "已导出，情绪分析失败", "warning")
+        if result.tone_status == "partial":
+            return ("转写完成，情绪分析部分失败" if result.status == "ready" else "已导出，情绪分析部分失败", "warning")
+    return status, tone
+
+
 def _speaker_label(speaker_id: str | None) -> str:
     return {
         "speaker_1": "说话人1",
         "speaker_2": "说话人2",
     }.get(speaker_id, "说话人待确认" if not speaker_id else speaker_id)
+
+
+def _format_acoustic_features(value) -> str:
+    if not isinstance(value, dict):
+        return ""
+    parts = []
+    rate = value.get("speech_rate_chinese_chars_per_min")
+    if isinstance(rate, (int, float)):
+        count = value.get("chinese_character_count")
+        duration = value.get("denominator_seconds")
+        if isinstance(count, int) and isinstance(duration, (int, float)):
+            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟（{count} 字/{float(duration):.2f} 秒）")
+        else:
+            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟")
+    rms = value.get("rms_dbfs")
+    if isinstance(rms, (int, float)):
+        parts.append(f"音量 RMS {float(rms):.1f} dBFS")
+    pause_count = value.get("pause_count")
+    pause_seconds = value.get("pause_total_seconds")
+    if isinstance(pause_count, int) and isinstance(pause_seconds, (int, float)):
+        parts.append(f"内部停顿 {pause_count} 次/{float(pause_seconds):.2f} 秒")
+    f0 = value.get("f0_median_hz")
+    if isinstance(f0, (int, float)):
+        parts.append(f"基频中位数 {float(f0):.1f} Hz")
+    contour = value.get("final_contour_candidate")
+    if contour in {"up", "down", "flat"}:
+        label = {"up": "上扬", "down": "下降", "flat": "平稳"}[contour]
+        delta = value.get("semitone_delta")
+        suffix = f" {float(delta):+.1f} 半音" if isinstance(delta, (int, float)) else ""
+        parts.append(f"句末音高走势候选 {label}{suffix}（不直接判断疑问句）")
+    if not parts and value.get("analysis_status") == "invalid":
+        return f"声学分析不可用（{value.get('analysis_reason') or '输入无效'}）"
+    return " · ".join(parts)
+
+
+def _emotion_label_zh(label: str) -> str:
+    return {
+        "angry": "愤怒",
+        "disgusted": "厌恶",
+        "fearful": "害怕",
+        "happy": "开心",
+        "neutral": "平静",
+        "other": "其他",
+        "sad": "悲伤",
+        "surprised": "惊讶",
+        "unknown": "未知",
+    }.get(label.casefold(), label or "未知")
+
+
+def _emotion_reason_zh(reason) -> str:
+    return {
+        "uncertain_word_or_speaker": "转写置信度或说话人归属不确定",
+        "speaker_unassigned": "说话人未可靠归属",
+        "speaker_overlap": "存在说话人重叠",
+        "no_speaker_track": "当前时间没有说话人轨道覆盖",
+        "speaker_alignment_mismatch": "转写词与说话人轨道不一致",
+        "window_too_short": "可靠语音窗口过短",
+        "emotion_runtime_failed": "情绪模型运行失败",
+    }.get(str(reason), "当前窗口无法可靠分析")
 
 
 def _set_status_badge(label: QLabel, text: str, tone: str) -> None:

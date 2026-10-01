@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import ASR_MODEL_DIR, DIARIZATION_MODEL_DIR, MODEL_ROOT
+from config import (
+    ASR_MODEL_DIR,
+    DIARIZATION_MODEL_DIR,
+    MODEL_ROOT,
+    TEMP_ROOT,
+    TONE_MODEL_DIR,
+    TONE_RUNTIME_DIR,
+)
 
 
 ASR_REPOSITORY = "Systran/faster-whisper-large-v3"
@@ -291,6 +299,14 @@ def prepare_diarization(token: str | None) -> dict[str, dict[str, str]]:
 
 def verify_models() -> list[str]:
     problems = []
+    try:
+        from core.emotion import check_emotion_assets
+
+        tone_assets = check_emotion_assets(TONE_MODEL_DIR, TONE_RUNTIME_DIR)
+        if not tone_assets.get("ready"):
+            problems.append(str(tone_assets.get("reason") or f"缺少 emotion2vec 资源：{TONE_MODEL_DIR}"))
+    except Exception as exc:
+        problems.append(f"无法检查 emotion2vec 资源：{type(exc).__name__}")
     if (
         not ASR_MODEL_DIR.is_dir()
         or any(not (ASR_MODEL_DIR / name).is_file() for name in _ASR_REQUIRED_FILES)
@@ -337,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="准备并校验本地离线模型资源。")
     parser.add_argument("--asr", action="store_true", help="准备 large-v3 ASR 模型")
     parser.add_argument("--diarization", action="store_true", help="准备 pyannote 双人分离及所有关联模型")
+    parser.add_argument("--tone", action="store_true", help="准备隔离的 emotion2vec CPU 运行依赖和模型")
     parser.add_argument("--verify", action="store_true", help="只检查模型和本地路径")
     parser.add_argument(
         "--prompt-token",
@@ -353,14 +370,15 @@ def main(argv: list[str] | None = None) -> int:
             for problem in problems:
                 print(f"未就绪：{problem}")
             return 1
-        print("离线模型文件与 pyannote 本地引用检查通过。")
+        print("离线模型文件、pyannote 本地引用与所需 emotion2vec 资源检查通过。")
         return 0
 
-    selected = args.asr or args.diarization
+    selected = args.asr or args.diarization or args.tone
     do_asr = args.asr if selected else True
     do_diarization = args.diarization if selected else True
+    do_tone = args.tone
     token = _token()
-    if args.prompt_token:
+    if args.prompt_token and do_diarization:
         try:
             token = getpass.getpass("Hugging Face token（输入隐藏，不会保存）：").strip()
         except (EOFError, KeyboardInterrupt):
@@ -375,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
             entries.update(prepare_asr(token, args.asr_revision))
         if do_diarization:
             entries.update(prepare_diarization(token))
+        if do_tone:
+            _prepare_tone_model()
         _write_manifest(entries)
     except ModelPreparationError as exc:
         print(f"准备未完成：{exc}", file=sys.stderr)
@@ -382,6 +402,35 @@ def main(argv: list[str] | None = None) -> int:
     for name, item in entries.items():
         print(f"{name}: revision={item['revision']} path={item['path']}")
     return 0
+
+
+def _prepare_tone_model() -> None:
+    helper = PROJECT_ROOT / "tools" / "prepare_tone_model.py"
+    if not helper.is_file():
+        raise ModelPreparationError(f"情绪模型准备脚本不存在：{helper}")
+    TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="consult-asr-tone-", dir=TEMP_ROOT) as temporary:
+            command = [
+                sys.executable,
+                "-X",
+                "utf8",
+                "-B",
+                str(helper),
+                "--model-dir",
+                str(TONE_MODEL_DIR),
+                "--runtime-dir",
+                str(TONE_RUNTIME_DIR),
+                "--temp-dir",
+                temporary,
+            ]
+            completed = subprocess.run(command, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ModelPreparationError(f"无法启动 emotion2vec 准备流程：{type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        raise ModelPreparationError(
+            f"emotion2vec 准备流程失败（exit {completed.returncode}）；请检查上方安装或模型下载错误。"
+        )
 
 
 if __name__ == "__main__":

@@ -1,7 +1,17 @@
 # Version
 
-Current version: **2.1.0**
+Current version: **2.2.0**
 Updated: 2026-10-01
+
+## 2.2.0
+
+- Add optional local emotion2vec analysis, enabled by default in the GUI, with speaker-attributed windows no longer than six seconds, raw model scores, and explicit unknown/partial-failure states.
+- Add Chinese speech rate, RMS level, internal pauses, median pitch, and a final pitch-contour candidate per reliable speaker window; pitch rise is described as an acoustic cue, not a question classifier.
+- Use raw diarization tracks with word certainty to mask overlap, uncertain/unassigned words, alignment mismatches, and unsupported gaps locally; count each fully safe ASR word once when it crosses a window boundary, and keep short-window acoustics available when emotion inference is too short.
+- Add an isolated CPU-only emotion runtime and pinned local model preparation without changing the existing application dependency lock.
+- Extend the preview and paired Word/JSON export with feature summaries, model metadata, and score limitations while retaining schema version 1 for legacy export calls.
+- Verify the pinned model with an offline CPU forward pass on synthetic mono audio and through the integrated pipeline/export path; the nine raw scores and model revision, weight hash, and CPU metadata matched expectations. `tools/prepare_models.py --verify` passed for the local ASR, pyannote, model, and runtime assets. These checks validate integration only, not emotion accuracy.
+- Verify synthetic overlap, uncertain-word, track-covered and unsupported gaps, speaker-ID masking, six-second boundary counting, subsecond acoustics, offscreen preview, paired exports, and schema versions. The emotion checkbox only disables emotion inference; safe-window acoustics remain enabled. Independent review closed its single P1 window-attribution finding after one focused repair; no real-recording classification accuracy or hourly throughput claim is made.
 
 ## 2.1.0
 

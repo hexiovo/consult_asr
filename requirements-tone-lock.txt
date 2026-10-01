@@ -1,0 +1,35 @@
+# Optional isolated emotion2vec CPU runtime for the verified Windows CPython 3.10 host.
+# Install with --target .runtime/tone --no-deps --only-binary=:all: --require-hashes.
+# Torch, torchaudio, numpy, scipy, soundfile, PyYAML, omegaconf, sentencepiece,
+# tqdm, requests and tensorboardX are already fixed in requirements-lock.txt.
+# FunASR's broad package extras (cloud storage, UMAP, Korean/Japanese tokenizers,
+# training and visualization) are not used by this local emotion2vec inference path.
+# The pinned local-directory API does not import ModelScope; preparation uses its
+# public HTTPS file API directly through the already-installed requests package.
+
+funasr==1.1.5 \
+    --hash=sha256:e75f3ffc33d3bcd0af98653fbd96edf3b8b475d0a047fbf0b9a37cd1edd10313
+hydra-core==1.3.7 \
+    --hash=sha256:83606c4a05c770f1e026e0489875f28989829d151799eabd8cfa8cbe82164515
+librosa==0.11.0 \
+    --hash=sha256:0b6415c4fd68bff4c29288abe67c6d80b587e0e1e2cfb0aad23e4559504a7fa1
+kaldiio==2.18.1 \
+    --hash=sha256:397a4cd18977acaae7acabfba6807ee0a6978c620064381a266eac15b3c1a0a0
+audioread==3.1.0 \
+    --hash=sha256:b30d1df6c5d3de5dcef0fb0e256f6ea17bdcf5f979408df0297d8a408e2971b4
+numba==0.68.0 \
+    --hash=sha256:83c22d3cede341102bc215e373c6db30ac36a4aee46ba3d5fb8a574f7a580933
+llvmlite==0.50.0 \
+    --hash=sha256:cda14ab787e609c2c2c5d1386a6d5f8723e9d047d27341585f606c27dc5744ab
+decorator==5.3.1 \
+    --hash=sha256:f47fe6fdbd2edd623ecfe36875d37aba411624e2670dd395dddae1358689bb3c
+pooch==1.9.0 \
+    --hash=sha256:f265597baa9f760d25ceb29d0beb8186c243d6607b0f60b83ecf14078dbc703b
+platformdirs==4.12.2 \
+    --hash=sha256:29dbf06d96c500bc6bdbce75fb0a14d63279c93b1842f97e72a135b33e856983
+soxr==1.1.0 \
+    --hash=sha256:b2e94c713b7d96fb92841947b785bcee6606124bc852273fab70454b51bfe270
+lazy-loader==0.6 \
+    --hash=sha256:77253be3391b06124a0e16105bd663b6c54470af1a9ca8e1cf026f38d58ed056
+msgpack==1.2.3 \
+    --hash=sha256:4c0780095871ecc49a58b2ff6b1b43b25214704da67646557ca287a3f49fb2dd
