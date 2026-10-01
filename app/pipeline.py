@@ -109,6 +109,7 @@ class ConsultationPipeline:
         *,
         cancel_event: Event | None = None,
         progress: ProgressCallback | None = None,
+        stage_progress: Callable[[str, float, float], None] | None = None,
     ) -> FileAnalysis:
         source = Path(input_path).expanduser().resolve()
         destination = Path(output_dir).expanduser().resolve()
@@ -118,6 +119,11 @@ class ConsultationPipeline:
         diarizer: Diarizer | None = None
         emotion_recognizer: Any | None = None
         result.tone_enabled = self.tone_enabled
+
+        def timing(stage: str, fraction: float = 0.0) -> None:
+            if stage_progress:
+                stage_progress(stage, fraction, result.duration_seconds or 0.0)
+
         try:
             if not source.is_file():
                 raise FileNotFoundError("所选音频文件不存在。")
@@ -148,17 +154,25 @@ class ConsultationPipeline:
 
             if progress:
                 progress("正在规范化音频（16 kHz 单声道）…")
+            timing("normalize")
             normalized = normalize_audio(source, task_dir, cancel_event)
             result.duration_seconds = _duration_seconds(normalized)
+            timing("normalize", 1.0)
 
             if progress:
                 progress("正在识别中文语音…")
+            timing("asr")
             transcriber = Transcriber(
                 device=self.device,
                 compute_type=self.compute_type,
                 beam_size=self.beam_size,
             )
-            result.words = transcriber.transcribe(normalized, cancel_event=cancel_event)
+            transcription_options: dict[str, Any] = {"cancel_event": cancel_event}
+            if stage_progress and result.duration_seconds:
+                transcription_options["progress_seconds"] = lambda seconds: timing(
+                    "asr", min(1.0, seconds / result.duration_seconds))
+            result.words = transcriber.transcribe(normalized, **transcription_options)
+            timing("asr", 1.0)
             del transcriber
             _release_memory()
 
@@ -175,14 +189,17 @@ class ConsultationPipeline:
 
             if progress:
                 progress("正在区分说话人…")
+            timing("diarization")
             diarizer = Diarizer(device=self.device)
             diarization = diarizer.diarize(normalized, cancel_event=cancel_event)
+            timing("diarization", 1.0)
             result.words = align_words(diarization, result.words)
             result.segments = _merge_turns(result.words)
             if cancel_event and cancel_event.is_set():
                 raise ProcessingCancelled("已在说话人分离安全边界取消。")
 
             if self.tone_enabled is not None:
+                timing("acoustics")
                 if progress:
                     progress("正在提取语速、音量、停顿和音高走势…")
                 result.analysis_windows = _build_analysis_windows(
@@ -190,10 +207,11 @@ class ConsultationPipeline:
                     speaker_tracks(diarization),
                     result.duration_seconds,
                 )
-                for window in result.analysis_windows:
+                for window_index, window in enumerate(result.analysis_windows):
                     if cancel_event and cancel_event.is_set():
                         raise ProcessingCancelled("已在声学特征分析安全边界取消。")
                     if not window.get("analysis_safe"):
+                        timing("acoustics", (window_index + 1) / len(result.analysis_windows))
                         continue
                     text = "".join(window.pop("_word_texts", []))
                     try:
@@ -210,6 +228,8 @@ class ConsultationPipeline:
                     window["acoustics"] = acoustics
                     window["chinese_character_count"] = acoustics["chinese_character_count"]
                     window["denominator_seconds"] = acoustics["denominator_seconds"]
+                    timing("acoustics", (window_index + 1) / len(result.analysis_windows))
+                timing("acoustics", 1.0)
                 if self.tone_enabled is False:
                     for window in result.analysis_windows:
                         if window.get("analysis_safe"):
@@ -221,6 +241,7 @@ class ConsultationPipeline:
                             })
 
             if self.tone_enabled is True:
+                timing("emotion")
                 if progress:
                     progress("正在分析局部语音情绪倾向（CPU）…")
                 result.emotion_windows = result.analysis_windows
@@ -236,7 +257,7 @@ class ConsultationPipeline:
                                 model_dir=self.tone_model_dir,
                                 runtime_dir=self.tone_runtime_dir,
                             )
-                            for window in candidates:
+                            for window_index, window in enumerate(candidates):
                                 if cancel_event and cancel_event.is_set():
                                     raise ProcessingCancelled("已在情绪分析窗口边界取消。")
                                 try:
@@ -256,10 +277,12 @@ class ConsultationPipeline:
                                         "label": "unknown",
                                         "reason": "window_too_short",
                                     })
+                                    timing("emotion", (window_index + 1) / len(candidates))
                                     continue
                                 _apply_emotion_prediction(window, prediction)
                                 if prediction.get("model"):
                                     result.tone_model = _public_model_metadata(prediction["model"])
+                                timing("emotion", (window_index + 1) / len(candidates))
                     except ProcessingCancelled:
                         raise
                     except emotion_runtime_error as exc:
@@ -294,6 +317,7 @@ class ConsultationPipeline:
                                 "label": "unknown",
                                 "reason": "emotion_runtime_failed",
                             })
+                timing("emotion", 1.0)
             if cancel_event and cancel_event.is_set():
                 raise ProcessingCancelled("已在文件分析完成前取消。")
             result.status = "ready"
@@ -306,6 +330,7 @@ class ConsultationPipeline:
             result.status = "failed"
             result.error = _safe_error(exc)
         finally:
+            timing("cleanup")
             if emotion_recognizer is not None:
                 try:
                     emotion_recognizer.close()
@@ -321,6 +346,7 @@ class ConsultationPipeline:
                 except OSError:
                     pass
             result.elapsed_seconds = time.perf_counter() - started
+            timing("cleanup", 1.0)
         return result
 
     def export_file(

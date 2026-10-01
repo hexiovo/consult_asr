@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint
+from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,12 +44,15 @@ from core.diarizer import Diarizer
 from core.transcriber import Transcriber
 from core.transcript import build_sentences, format_sentence
 from tools.prepare_models import verify_models
-from utils.audio_utils import collect_audio_files
+from utils.audio_utils import collect_audio_files, probe_audio_duration
+from utils.time_estimator import TimeEstimator
 
 
 class ProcessingWorker(QThread):
     progress = Signal(int, int, str)
     analysis_ready = Signal(int, object)
+    timing_configured = Signal(object, str)
+    stage_progress = Signal(int, str, float, float)
 
     def __init__(self, files, input_root, output_root, device_choice, compute_type, beam_size, tone_enabled=None):
         super().__init__()
@@ -80,6 +84,11 @@ class ProcessingWorker(QThread):
             compute_type = self.compute_type
             if device == "cpu":
                 compute_type = "int8" if compute_type == "int8_float16" else "float32"
+            durations = []
+            for path in self.files:
+                durations.append(None if self.cancel_event.is_set() else probe_audio_duration(path))
+            profile = f"v1-{device}-{compute_type}-beam{self.beam_size}-emotion{int(bool(self.tone_enabled))}"
+            self.timing_configured.emit(durations, profile)
             pipeline = ConsultationPipeline(
                 device=device,
                 compute_type=compute_type,
@@ -117,6 +126,8 @@ class ProcessingWorker(QThread):
                     progress=lambda stage, i=index, t=total: self.progress.emit(
                         i, t, f"[{i}/{t}] {stage}"
                     ),
+                    stage_progress=lambda stage, fraction, seconds, row=index - 1:
+                        self.stage_progress.emit(row, stage, fraction, seconds),
                 )
                 self.analysis_ready.emit(index - 1, analysis)
                 completed_indices.add(index - 1)
@@ -155,6 +166,12 @@ class MainWindow(QMainWindow):
         self.role_choices: dict[str, str | None] = {}
         self._updating_role = False
         self._close_when_done = False
+        self._time_estimator = TimeEstimator()
+        self._timing_profile: str | None = None
+        self._timing_settings = QSettings("ConsultASR", "LocalTiming")
+        self._timing_timer = QTimer(self)
+        self._timing_timer.setInterval(1000)
+        self._timing_timer.timeout.connect(self._update_time_estimate)
         self.setStyleSheet(_window_stylesheet())
 
         central = QWidget()
@@ -400,6 +417,15 @@ class MainWindow(QMainWindow):
         self.counts_label.setObjectName("mutedLabel")
         activity_row.addWidget(self.counts_label)
         outer.addLayout(activity_row)
+        self.time_estimate_label = QLabel("已用 00:00 · 预计剩余：开始处理后估计")
+        self.time_estimate_label.setObjectName("mutedLabel")
+        self.time_estimate_label.setWordWrap(True)
+        self.time_estimate_label.setToolTip(
+            "整队列估计参考相同设备与识别设置下最近五次成功处理的耗时和音频时长。"
+            "首次运行显示当前阶段估计；进度不可见、超时或数据不足时显示评估中。"
+            "本地只保存数字耗时比例，不保存录音名称、路径或内容。"
+        )
+        outer.addWidget(self.time_estimate_label)
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("thinProgress")
         self.progress_bar.setRange(0, 100)
@@ -427,6 +453,33 @@ class MainWindow(QMainWindow):
         self._show_selected_analysis()
         self._refresh_model_state()
         self._update_counts()
+
+    def _reset_time_estimate(self):
+        self._timing_timer.stop()
+        self._time_estimator = TimeEstimator()
+        self._timing_profile = None
+        self.time_estimate_label.setText("已用 00:00 · 预计剩余：开始处理后估计")
+
+    def _configure_timing(self, durations, profile):
+        self._timing_profile = profile
+        try:
+            rates = json.loads(self._timing_settings.value(f"rates/{profile}", "[]"))
+            if not isinstance(rates, list):
+                rates = []
+        except (ValueError, TypeError):
+            rates = []
+        self._time_estimator.configure(durations, rates)
+        self._update_time_estimate()
+
+    def _stage_timing(self, row, stage, fraction, audio_seconds):
+        self._time_estimator.progress(row, stage, fraction, audio_seconds)
+        self._update_time_estimate()
+
+    def _update_time_estimate(self):
+        if self._time_estimator.started is None:
+            return
+        cancelling = bool(self.worker and self.worker.cancel_event.is_set())
+        self.time_estimate_label.setText(self._time_estimator.text(cancelling))
 
     def _refresh_model_state(self, *, preserve_status: bool = False):
         problems = verify_models()
@@ -504,6 +557,7 @@ class MainWindow(QMainWindow):
         self._set_inputs(files, root)
 
     def _set_inputs(self, files, root):
+        self._reset_time_estimate()
         unique = sorted({Path(item).resolve() for item in files}, key=lambda item: str(item).casefold())
         self.input_files = unique
         self.input_root = Path(root).resolve() if root else None
@@ -530,6 +584,7 @@ class MainWindow(QMainWindow):
     def _clear_queue(self):
         if self.worker and self.worker.isRunning():
             return
+        self._reset_time_estimate()
         self.input_files = []
         self.input_root = None
         self.analyses = []
@@ -599,6 +654,8 @@ class MainWindow(QMainWindow):
         )
         self.worker.progress.connect(self._progress)
         self.worker.analysis_ready.connect(self._analysis_ready)
+        self.worker.timing_configured.connect(self._configure_timing)
+        self.worker.stage_progress.connect(self._stage_timing)
         self.worker.finished.connect(self._finished)
         self.start_button.setEnabled(False)
         self.tone_enabled_check.setEnabled(False)
@@ -607,6 +664,10 @@ class MainWindow(QMainWindow):
         self.choose_folder_button.setEnabled(False)
         self.progress_bar.setValue(0)
         self.progress_label.setText("正在准备处理队列…")
+        self._timing_profile = None
+        self._time_estimator.start(len(self.input_files))
+        self._timing_timer.start()
+        self._update_time_estimate()
         self.worker.start()
 
     def _cancel(self):
@@ -614,6 +675,7 @@ class MainWindow(QMainWindow):
             self.worker.cancel()
             self.cancel_button.setEnabled(False)
             self.progress_label.setText("已请求取消；将于当前安全处理边界停止。")
+            self._update_time_estimate()
 
     def _progress(self, current, total, message):
         self.progress_label.setText(message)
@@ -631,6 +693,12 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.analyses):
             return
         self.analyses[row] = result
+        learn_timing = result.status == "ready" and bool(result.words) and result.tone_status not in {"failed", "partial"}
+        self._time_estimator.complete(row, result.duration_seconds, result.elapsed_seconds, learn_timing)
+        if learn_timing and self._timing_profile:
+            self._timing_settings.setValue(f"rates/{self._timing_profile}", json.dumps(self._time_estimator.rates))
+            self._timing_settings.sync()
+        self._update_time_estimate()
         status_text, tone = _analysis_status(result)
         self._set_queue_status(row, tone, status_text)
         detail = result.error or f"{len(result.words)} 个时间片段 · {result.elapsed_seconds:.1f} 秒"
@@ -674,6 +742,9 @@ class MainWindow(QMainWindow):
                 item.setToolTip(f"{text}\n{path}")
 
     def _finished(self):
+        self._timing_timer.stop()
+        self._time_estimator.finish()
+        self._update_time_estimate()
         self.cancel_button.setEnabled(False)
         self.choose_files_button.setEnabled(True)
         self.choose_folder_button.setEnabled(True)

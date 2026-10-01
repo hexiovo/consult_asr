@@ -117,6 +117,7 @@ class Transcriber:
         audio_path: str | os.PathLike[str],
         cancel_event: Event | None = None,
         progress: Callable[[str], None] | None = None,
+        progress_seconds: Callable[[float], None] | None = None,
     ) -> list[dict[str, Any]]:
         audio = Path(audio_path).expanduser().resolve()
         if not audio.is_file():
@@ -164,6 +165,8 @@ class Transcriber:
                             "text": text,
                             "uncertain": True,
                         })
+                if progress_seconds:
+                    progress_seconds(float(segment.end))
             return sorted(words, key=lambda item: (item["start"], item["end"]))
 
         # OpenAI Whisper does not expose native word timestamps. This fallback is

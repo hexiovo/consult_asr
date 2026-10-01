@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 from pathlib import Path
+import shutil
 import subprocess
 import time
+import wave
 from threading import Event
 
 from config import FFMPEG_EXECUTABLE, SUPPORTED_AUDIO_EXTENSIONS
@@ -30,6 +34,32 @@ def collect_audio_files(input_path: str | os.PathLike[str]) -> list[Path]:
         if is_audio_file(Path(root) / name)
     ]
     return sorted((item.resolve() for item in files), key=lambda item: str(item).casefold())
+
+
+def probe_audio_duration(source_path: str | os.PathLike[str]) -> float | None:
+    """Read duration metadata only; unavailable metadata must not stop a job."""
+    source = Path(source_path)
+    try:
+        with wave.open(str(source), "rb") as audio:
+            return audio.getnframes() / audio.getframerate()
+    except (OSError, wave.Error, EOFError, ZeroDivisionError):
+        pass
+    sibling = Path(FFMPEG_EXECUTABLE).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe") if FFMPEG_EXECUTABLE else None
+    executable = str(sibling) if sibling and sibling.is_file() else shutil.which("ffprobe")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(source)],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode == 0:
+            duration = float(json.loads(result.stdout)["format"]["duration"])
+            return duration if math.isfinite(duration) and duration > 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        pass
+    return None
 
 
 def normalize_audio(

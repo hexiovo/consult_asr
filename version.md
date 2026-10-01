@@ -1,7 +1,14 @@
 # Version
 
-Current version: **2.2.1**
+Current version: **2.2.2**
 Updated: 2026-10-01
+
+## 2.2.2
+
+- Show elapsed time, measured current-stage remaining time and a duration-weighted queue estimate using recent successful runs with the same device, precision, beam size and emotion setting.
+- Report calibration/overrun as an estimate in progress, stop forecasting on cancellation, reset on new queues and freeze elapsed time after completion.
+- Probe audio metadata in the worker and persist only five anonymous numerical processing-rate samples per setting; do not store recording names, paths or content in timing history.
+- Verify ETA arithmetic and overrun handling with a controlled clock, synthetic audio metadata, ASR/pipeline/worker progress hooks, partial-failure/cancellation preservation, and the real offscreen Qt label/timer/layout without loading models or using private recordings.
 
 ## 2.2.1
 
