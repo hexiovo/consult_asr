@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.2.0**
+Current version: **2.2.1**
 Updated: 2026-10-01
+
+## 2.2.1
+
+- Split preview and Word transcripts into sentences and append possible emotion plus the original model confidence score in parentheses after each sentence.
+- Match only same-speaker reliable emotion windows, require full coverage of spoken word intervals, retain unknown/disabled states, and keep scores uncalibrated rather than inventing sentence probabilities.
+- Add structured sentences with annotated text and source-window timestamps to extended JSON exports while preserving existing words, segments, and raw analysis windows.
 
 ## 2.2.0
 

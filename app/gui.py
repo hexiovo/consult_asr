@@ -41,6 +41,7 @@ from config import (
 )
 from core.diarizer import Diarizer
 from core.transcriber import Transcriber
+from core.transcript import build_sentences, format_sentence
 from tools.prepare_models import verify_models
 from utils.audio_utils import collect_audio_files
 
@@ -761,10 +762,10 @@ class MainWindow(QMainWindow):
             lines = ["处理失败", result.error]
             if result.words:
                 lines.extend(["", "已保留识别文本（说话人区分未完成）："])
-                for item in result.words:
+                for item in build_sentences(result.words, tone_enabled=result.tone_enabled):
                     start = max(0, int(item.get("start", 0)))
                     speaker = _speaker_label(item.get("speaker_id"))
-                    lines.append(f"[{start // 60:02d}:{start % 60:02d}] {speaker}：{item.get('text', '')}")
+                    lines.append(f"[{start // 60:02d}:{start % 60:02d}] {speaker}：{format_sentence(item)}")
             self.preview.setPlainText("\n".join(lines))
         elif result.status == "cancelled":
             self.preview.setPlainText("处理已取消\n" + result.error)
@@ -772,12 +773,12 @@ class MainWindow(QMainWindow):
             self.preview.setPlainText("未检测到语音。仍可保存一份标明无语音的 Word 和 JSON 结果。")
         elif result.words:
             lines = []
-            for item in result.segments:
+            for item in build_sentences(result.words, result.emotion_windows, result.tone_enabled):
                 start = max(0, int(float(item["start"])))
                 timestamp = f"[{start // 60:02d}:{start % 60:02d}]"
                 speaker = _speaker_label(item.get("speaker_id"))
                 mark = " 〔待核对〕" if item.get("uncertain") else ""
-                lines.append(f"{timestamp} {speaker}：{item['text']}{mark}")
+                lines.append(f"{timestamp} {speaker}{mark}：{format_sentence(item)}")
             if result.tone_enabled is not None:
                 lines.extend(["", "语音特征"])
                 for window in result.analysis_windows:
@@ -798,18 +799,7 @@ class MainWindow(QMainWindow):
                     if result.tone_status in {"failed", "partial"}:
                         state = "部分失败" if result.tone_status == "partial" else "失败"
                         lines.append(f"情绪倾向分析：{state}。{result.tone_error}")
-                    lines.append("情绪趋势（模型置信分数为未校准原始输出）")
-                    for window in result.analysis_windows:
-                        start = max(0, int(float(window.get("start", 0))))
-                        end = max(0, int(float(window.get("end", 0))))
-                        speaker = _speaker_label(window.get("speaker_id"))
-                        if window.get("status") == "ok":
-                            label = _emotion_label_zh(str(window.get("label") or "unknown"))
-                            score = window.get("model_score")
-                            detail = f"{label} · 模型置信分数 {float(score):.3f}" if isinstance(score, (int, float)) else label
-                        else:
-                            detail = f"未知（{_emotion_reason_zh(window.get('reason'))}）"
-                        lines.append(f"[{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}] {speaker}：{detail}")
+                    lines.append("句后置信度显示未校准的模型原始分数，不代表准确率或概率。")
             self.preview.setPlainText("\n".join(lines))
         else:
             self.preview.setPlainText("没有可预览的转写内容。")
@@ -954,20 +944,6 @@ def _format_acoustic_features(value) -> str:
     if not parts and value.get("analysis_status") == "invalid":
         return f"声学分析不可用（{value.get('analysis_reason') or '输入无效'}）"
     return " · ".join(parts)
-
-
-def _emotion_label_zh(label: str) -> str:
-    return {
-        "angry": "愤怒",
-        "disgusted": "厌恶",
-        "fearful": "害怕",
-        "happy": "开心",
-        "neutral": "平静",
-        "other": "其他",
-        "sad": "悲伤",
-        "surprised": "惊讶",
-        "unknown": "未知",
-    }.get(label.casefold(), label or "未知")
 
 
 def _emotion_reason_zh(reason) -> str:

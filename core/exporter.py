@@ -10,6 +10,8 @@ from typing import Any, Mapping
 
 from docx import Document
 
+from core.transcript import build_sentences, format_sentence
+
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -36,23 +38,6 @@ def _available_stem(directory: Path, requested: str) -> str:
 def _stamp(seconds: float) -> str:
     whole = max(0, int(seconds))
     return f"{whole // 60:02d}:{whole % 60:02d}"
-
-
-_EMOTION_LABELS_ZH = {
-    "angry": "愤怒",
-    "disgusted": "厌恶",
-    "fearful": "害怕",
-    "happy": "开心",
-    "neutral": "平静",
-    "other": "其他",
-    "sad": "悲伤",
-    "surprised": "惊讶",
-    "unknown": "未知",
-}
-
-
-def _emotion_label(label: str) -> str:
-    return _EMOTION_LABELS_ZH.get(label.casefold(), label or "未知")
 
 
 def _emotion_reason(reason: Any) -> str:
@@ -160,6 +145,7 @@ def write_exports(
         }
         for turn in sorted(segments, key=lambda item: (float(item["start"]), float(item["end"])))
     ]
+    sentences = build_sentences(words, emotion_windows, tone_enabled)
     doc = Document()
     doc.add_heading("咨询记录", level=1)
     doc.add_paragraph(f"音频：{Path(source_name).name}")
@@ -167,12 +153,12 @@ def write_exports(
         doc.add_paragraph(f"时长：{_stamp(duration_seconds)}")
     if not turns:
         doc.add_paragraph("未检测到语音。")
-    for turn in turns:
-        speaker_id = turn["speaker_id"]
+    for sentence in sentences:
+        speaker_id = sentence["speaker_id"]
         speaker = speaker_names.get(speaker_id, "说话人（待确认）")
-        marker = " [待核对]" if turn["uncertain"] else ""
-        timestamp = f"[{_stamp(turn['start'])}–{_stamp(turn['end'])}] "
-        doc.add_paragraph(f"{timestamp}{speaker}：{turn['text']}{marker}")
+        marker = " [待核对]" if sentence["uncertain"] else ""
+        timestamp = f"[{_stamp(sentence['start'])}–{_stamp(sentence['end'])}] "
+        doc.add_paragraph(f"{timestamp}{speaker}{marker}：{format_sentence(sentence)}")
 
     has_extended_analysis = any(
         value is not None
@@ -183,7 +169,8 @@ def write_exports(
         doc.add_paragraph(
             "声学语速根据可靠窗口内的 ASR 文字估算；情绪标签表示模型给出的语音倾向，不用于诊断。"
             "模型置信分数为未校准的原始输出，不是咨询场景准确率或概率。句末音高走势只描述声学变化，"
-            "不据此判定疑问句。"
+            "不据此判定疑问句。每句括号取同一说话人、与句中文字时间重叠最多的可靠窗口及其原始分数；"
+            "句中语音未被可靠情绪窗口完整覆盖时显示无法判定。"
         )
         feature_windows = analysis_windows if analysis_windows is not None else []
         if feature_windows:
@@ -215,15 +202,6 @@ def write_exports(
             if tone_status in {"failed", "partial"}:
                 status_text = "部分失败" if tone_status == "partial" else "失败"
                 doc.add_paragraph(f"语音情绪分析：{status_text}。" + (tone_error.strip() or "模型运行失败。"))
-            for window in emotion_windows or []:
-                speaker = speaker_names.get(window.get("speaker_id"), "说话人待确认")
-                timestamp = f"[{_stamp(float(window['start']))}–{_stamp(float(window['end']))}] "
-                label = _emotion_label(str(window.get("label") or "unknown"))
-                if window.get("status") == "ok" and isinstance(window.get("model_score"), (int, float)):
-                    description = f"情绪倾向：{label}（模型置信分数 {float(window['model_score']):.3f}，未校准）"
-                else:
-                    description = f"情绪倾向：未知（{_emotion_reason(window.get('reason'))}）"
-                doc.add_paragraph(f"{timestamp}{speaker}：{description}")
 
     json_words = [
         {
@@ -253,6 +231,11 @@ def write_exports(
         "segments": json_turns,
     }
     if has_extended_analysis:
+        payload["sentences"] = [
+            {**sentence, "speaker": speaker_names.get(sentence.get("speaker_id"), "说话人（待确认）"),
+             "annotated_text": format_sentence(sentence)}
+            for sentence in sentences
+        ]
         payload["tone_analysis"] = {
             "enabled": tone_enabled,
             "status": tone_status,
