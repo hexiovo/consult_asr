@@ -1,7 +1,14 @@
 # Version
 
-Current version: **2.2.2**
+Current version: **2.3.0**
 Updated: 2026-10-01
+
+## 2.3.0
+
+- Add sentence-level transcript and speaker correction with original word/timestamp preservation, sentence-range playback from the source audio, and paired Word/JSON re-export of revisions.
+- Persist completed results and pending queue state in a bounded local session file; restore only completed results, resume pending rows with their original queue mapping, and retain prior results when a source fingerprint changes.
+- Detect missing or stale export pairs on restore and make completed results available for re-export; speaker overrides keep emotion unknown while acoustic summaries remain attached to the original audio windows.
+- Validate restored result/window records and degrade an invalid queue row to pending without discarding other completed rows. Validate GUI session, row/ETA mapping, editor transitions, and asynchronous playback using synthetic data in an offscreen Qt window at 1280×800; no private recording, model inference, or GPU was used.
 
 ## 2.2.2
 

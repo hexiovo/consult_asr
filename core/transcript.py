@@ -80,6 +80,115 @@ def build_sentences(words: list[dict[str, Any]], emotion_windows: list[dict[str,
     Fragments inside one ASR word retain that word's original time bounds;
     character-level timestamps are not fabricated.
     """
+    return _build_sentences(words, emotion_windows, tone_enabled, preserve_intervals=False)
+
+
+def make_sentence_id(original_sentence_index: int, start: float, end: float) -> str:
+    """Return a text-independent ID for one original sentence interval.
+
+    The zero-based index disambiguates equal intervals. ``float.hex`` preserves
+    the exact parsed timestamp values while remaining stable across text and
+    punctuation corrections.
+    """
+    if (
+        isinstance(original_sentence_index, bool)
+        or not isinstance(original_sentence_index, int)
+        or original_sentence_index < 0
+    ):
+        raise ValueError("original sentence index must be a non-negative integer")
+    start_value, end_value = float(start), float(end)
+    if not math.isfinite(start_value) or not math.isfinite(end_value) or end_value < start_value:
+        raise ValueError("sentence ID timestamps must be finite and ordered")
+    return f"sentence-{original_sentence_index:06d}-{start_value.hex()}-{end_value.hex()}"
+
+
+def _sentence_fragments(text: str) -> list[str]:
+    """Split corrected display text at the same punctuation as ASR sentences."""
+    fragments: list[str] = []
+    offset = 0
+    for boundary in _SENTENCE_END.finditer(text):
+        fragment = text[offset:boundary.end()].strip()
+        if fragment:
+            fragments.append(fragment)
+        offset = boundary.end()
+    tail = text[offset:].strip()
+    if tail:
+        fragments.append(tail)
+    return fragments
+
+
+def revise_sentences(
+    words: list[dict[str, Any]],
+    overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    emotion_windows: list[dict[str, Any]] | None = None,
+    tone_enabled: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Apply sentence-level edits and return display/export fragments.
+
+    IDs are assigned before overrides from the original sentence's sorted
+    index and timestamps. Every fragment produced by edited punctuation keeps
+    that parent ``sentence_id`` and the original sentence ``start``/``end``;
+    ``fragment_id`` distinguishes the fragments in the current revision.
+    Timing is never divided at character boundaries.
+    """
+    base_sentences = _build_sentences(words, emotion_windows, tone_enabled, preserve_intervals=True)
+    windows = emotion_windows or []
+    output: list[dict[str, Any]] = []
+
+    for original_index, source in enumerate(base_sentences):
+        sentence_id = make_sentence_id(original_index, source["start"], source["end"])
+        override = (overrides or {}).get(sentence_id)
+        if override is not None and not isinstance(override, Mapping):
+            raise TypeError(f"override for {sentence_id} must be a mapping")
+
+        text_value = override.get("text", source["text"]) if override is not None else source["text"]
+        text = "" if text_value is None else str(text_value)
+        speaker_id = override.get("speaker_id", source["speaker_id"]) if override is not None else source["speaker_id"]
+        speaker_changed = speaker_id != source["speaker_id"]
+
+        for fragment_index, fragment in enumerate(_sentence_fragments(text)):
+            if speaker_changed:
+                emotion = {
+                    "status": "unknown",
+                    "label": "unknown",
+                    "model_score": None,
+                    "reason": "speaker_changed_in_override",
+                }
+            else:
+                emotion = _sentence_emotion(
+                    {
+                        "uncertain": source["uncertain"],
+                        "speaker_id": speaker_id,
+                        "_intervals": source["_intervals"],
+                    },
+                    windows,
+                    tone_enabled,
+                )
+
+            output.append(
+                {
+                    "sentence_id": sentence_id,
+                    "fragment_id": f"{sentence_id}:{fragment_index:04d}",
+                    "original_sentence_index": original_index,
+                    "fragment_index": fragment_index,
+                    "start": source["start"],
+                    "end": source["end"],
+                    "speaker_id": speaker_id,
+                    "text": fragment,
+                    "uncertain": source["uncertain"],
+                    "emotion": emotion,
+                }
+            )
+    return output
+
+
+def _build_sentences(
+    words: list[dict[str, Any]],
+    emotion_windows: list[dict[str, Any]] | None,
+    tone_enabled: bool | None,
+    *,
+    preserve_intervals: bool,
+) -> list[dict[str, Any]]:
     sentences: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
 
@@ -87,8 +196,9 @@ def build_sentences(words: list[dict[str, Any]], emotion_windows: list[dict[str,
         nonlocal current
         if current is not None and current["text"].strip():
             current["text"] = current["text"].strip()
-            current["emotion"] = _sentence_emotion(current, emotion_windows or [], tone_enabled)
-            current.pop("_intervals")
+            if not preserve_intervals:
+                current["emotion"] = _sentence_emotion(current, emotion_windows or [], tone_enabled)
+                current.pop("_intervals")
             sentences.append(current)
         current = None
 

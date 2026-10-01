@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 import re
@@ -45,6 +46,13 @@ class FileAnalysis:
     tone_model: dict[str, Any] | None = None
     tone_status: str | None = None
     tone_error: str = ""
+    sentence_revisions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    revision: int = 0
+    exported_revision: int = -1
+    profile: str | None = None
+    source_size_bytes: int | None = None
+    source_mtime_ns: int | None = None
+    source_changed: bool = False
 
     @property
     def display_name(self) -> str:
@@ -68,6 +76,69 @@ def _safe_error(exc: Exception) -> str:
             message = message.replace(value, "[已隐藏凭据]")
     message = re.sub(r"\bhf_[A-Za-z0-9]{16,}\b", "[已隐藏凭据]", message)
     return message[:700]
+
+
+def _processing_profile(
+    device: str,
+    compute_type: str | None,
+    beam_size: int,
+    tone_enabled: bool | None,
+) -> str:
+    return f"v1-{device}-{compute_type}-beam{beam_size}-emotion{int(bool(tone_enabled))}"
+
+
+def _source_fingerprint(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def _known_export_pair(result: FileAnalysis) -> tuple[Path, Path] | None:
+    """Return only a previously exported, same-directory Word/JSON pair."""
+    if (
+        isinstance(result.exported_revision, bool)
+        or not isinstance(result.exported_revision, int)
+        or result.exported_revision < 0
+        or result.word_path is None
+        or result.json_path is None
+    ):
+        return None
+    directory = result.output_dir.expanduser().resolve()
+    word_path = result.word_path.expanduser().resolve(strict=False)
+    json_path = result.json_path.expanduser().resolve(strict=False)
+    if (
+        word_path.parent != directory
+        or json_path.parent != directory
+        or word_path.suffix.lower() != ".docx"
+        or json_path.suffix.lower() != ".json"
+        or word_path.stem != json_path.stem
+    ):
+        return None
+    if not json_path.is_file():
+        return None
+    try:
+        with json_path.open("r", encoding="utf-8") as sidecar:
+            payload = json.load(sidecar)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("source_file") != result.input_path.name:
+        return None
+    source_fingerprint = payload.get("source_fingerprint")
+    if (
+        not isinstance(source_fingerprint, dict)
+        or isinstance(source_fingerprint.get("size_bytes"), bool)
+        or not isinstance(source_fingerprint.get("size_bytes"), int)
+        or isinstance(source_fingerprint.get("mtime_ns"), bool)
+        or not isinstance(source_fingerprint.get("mtime_ns"), int)
+        or result.source_size_bytes is None
+        or result.source_mtime_ns is None
+        or source_fingerprint["size_bytes"] != result.source_size_bytes
+        or source_fingerprint["mtime_ns"] != result.source_mtime_ns
+    ):
+        return None
+    return word_path, json_path
 
 
 def _release_memory() -> None:
@@ -114,6 +185,12 @@ class ConsultationPipeline:
         source = Path(input_path).expanduser().resolve()
         destination = Path(output_dir).expanduser().resolve()
         result = FileAnalysis(source, destination, status="processing")
+        result.profile = _processing_profile(
+            self.device,
+            self.compute_type,
+            self.beam_size,
+            self.tone_enabled,
+        )
         started = time.perf_counter()
         task_dir: Path | None = None
         diarizer: Diarizer | None = None
@@ -127,6 +204,9 @@ class ConsultationPipeline:
         try:
             if not source.is_file():
                 raise FileNotFoundError("所选音频文件不存在。")
+            fingerprint = _source_fingerprint(source)
+            if fingerprint is not None:
+                result.source_size_bytes, result.source_mtime_ns = fingerprint
             if cancel_event and cancel_event.is_set():
                 raise ProcessingCancelled("已在当前文件开始前取消。")
             emotion_api: Any | None = None
@@ -357,13 +437,33 @@ class ConsultationPipeline:
     ) -> tuple[Path, Path]:
         if result.status not in {"ready", "no_speech", "exported", "export_failed"}:
             raise ValueError("只有识别完成或无语音的文件可以导出。")
-        role_labels: dict[str, str] = {}
-        roles_confirmed = counselor_speaker in {"speaker_1", "speaker_2"} and bool(result.words)
-        if roles_confirmed:
-            other = "speaker_2" if counselor_speaker == "speaker_1" else "speaker_1"
-            role_labels[counselor_speaker] = "咨询师"
-            role_labels[other] = "来访者"
         try:
+            if result.source_changed:
+                raise ValueError("音频源已发生变化，请重新分析后再导出。")
+            fingerprint = _source_fingerprint(result.input_path)
+            if fingerprint is None:
+                result.source_changed = True
+                raise FileNotFoundError("原音频文件已不存在，请重新添加并分析。")
+            if result.source_size_bytes is None or result.source_mtime_ns is None:
+                result.source_size_bytes, result.source_mtime_ns = fingerprint
+            elif fingerprint != (result.source_size_bytes, result.source_mtime_ns):
+                result.source_changed = True
+                raise ValueError("音频源已发生变化，请重新分析后再导出。")
+
+            role_labels: dict[str, str] = {}
+            roles_confirmed = counselor_speaker in {"speaker_1", "speaker_2"} and bool(result.words)
+            if roles_confirmed:
+                other = "speaker_2" if counselor_speaker == "speaker_1" else "speaker_1"
+                role_labels[counselor_speaker] = "咨询师"
+                role_labels[other] = "来访者"
+            if not result.profile:
+                result.profile = _processing_profile(
+                    self.device,
+                    self.compute_type,
+                    self.beam_size,
+                    result.tone_enabled,
+                )
+            overwrite_paths = _known_export_pair(result)
             word_path, json_path = write_exports(
                 words=result.words,
                 output_dir=result.output_dir,
@@ -380,6 +480,10 @@ class ConsultationPipeline:
                 tone_status=result.tone_status,
                 tone_error=result.tone_error,
                 tone_model=result.tone_model,
+                sentence_revisions=result.sentence_revisions,
+                revision=result.revision,
+                overwrite_paths=overwrite_paths,
+                source_fingerprint={"size_bytes": fingerprint[0], "mtime_ns": fingerprint[1]},
             )
         except Exception as exc:
             result.status = "export_failed"
@@ -389,6 +493,7 @@ class ConsultationPipeline:
         result.json_path = json_path
         result.roles_confirmed = roles_confirmed
         result.counselor_speaker = counselor_speaker if roles_confirmed else None
+        result.exported_revision = result.revision
         result.status = "exported"
         result.error = ""
         return word_path, json_path

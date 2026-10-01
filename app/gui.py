@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import json
+import math
+import copy
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings
+from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings, QStandardPaths
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,21 +44,141 @@ from config import (
 )
 from core.diarizer import Diarizer
 from core.transcriber import Transcriber
-from core.transcript import build_sentences, format_sentence
+from core.transcript import build_sentences, format_sentence, make_sentence_id, revise_sentences
 from tools.prepare_models import verify_models
 from utils.audio_utils import collect_audio_files, probe_audio_duration
+from utils.result_store import AtomicJsonStore, ResultStoreError
 from utils.time_estimator import TimeEstimator
 
 
+_SESSION_SCHEMA_VERSION = 1
+_RESTORABLE_STATUSES = {"ready", "no_speech", "exported", "export_failed"}
+_MAX_SESSION_FILES = 2000
+_MAX_SESSION_WORDS = 1_000_000
+
+
+def _json_value(value, depth: int = 0):
+    """Convert supported analysis values to bounded JSON primitives."""
+    if depth > 24:
+        raise ValueError("会话数据层级过深")
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("会话数据包含无效数值")
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_value(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item, depth + 1) for item in value]
+    scalar = getattr(value, "item", None)
+    if callable(scalar):
+        return _json_value(scalar(), depth + 1)
+    raise ValueError("会话数据包含不支持的内容")
+
+
+def _valid_optional_number(value, *, minimum: float | None = None) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return False
+    return minimum is None or value >= minimum
+
+
+def _validate_window_records(windows, label: str) -> None:
+    if not isinstance(windows, list) or len(windows) > _MAX_SESSION_WORDS:
+        raise ValueError(f"缓存{label}无效")
+    for window in windows:
+        if not isinstance(window, dict):
+            raise ValueError(f"缓存{label}无效")
+        start, end = window.get("start"), window.get("end")
+        if (
+            not _valid_optional_number(start, minimum=0)
+            or not _valid_optional_number(end, minimum=0)
+            or start is None
+            or end is None
+            or end <= start
+            or window.get("speaker_id") not in {None, "speaker_1", "speaker_2"}
+            or not isinstance(window.get("analysis_safe"), bool)
+            or window.get("status") not in {"pending", "disabled", "unknown", "ok"}
+        ):
+            raise ValueError(f"缓存{label}无效")
+        if window.get("label") is not None and not isinstance(window.get("label"), str):
+            raise ValueError(f"缓存{label}无效")
+        if window.get("reason") is not None and not isinstance(window.get("reason"), str):
+            raise ValueError(f"缓存{label}无效")
+        if not _valid_optional_number(window.get("model_score")):
+            raise ValueError(f"缓存{label}数值无效")
+        labels = window.get("labels")
+        if labels is not None and (
+            not isinstance(labels, list) or any(not isinstance(item, str) for item in labels)
+        ):
+            raise ValueError(f"缓存{label}标签无效")
+        scores = window.get("scores")
+        if scores is not None and (
+            not isinstance(scores, list)
+            or any(not _valid_optional_number(item) or item is None for item in scores)
+        ):
+            raise ValueError(f"缓存{label}分数无效")
+        acoustics = window.get("acoustics")
+        if acoustics is not None and not isinstance(acoustics, dict):
+            raise ValueError("缓存声学窗口无效")
+        if isinstance(acoustics, dict):
+            contour = acoustics.get("final_contour_candidate")
+            if contour is not None and not isinstance(contour, str):
+                raise ValueError("缓存声学窗口无效")
+            for key in (
+                "speech_rate_chinese_chars_per_min",
+                "rms_dbfs",
+                "pause_threshold_seconds",
+                "pause_energy_threshold_dbfs",
+                "pause_total_seconds",
+                "pause_max_seconds",
+                "f0_median_hz",
+                "f0_coverage",
+                "semitone_delta",
+                "contour_coverage",
+                "denominator_seconds",
+            ):
+                if key in acoustics and not _valid_optional_number(acoustics[key]):
+                    raise ValueError("缓存声学数值无效")
+        # Check every nested value too, including acoustic/model metadata fields
+        # that the current preview does not display.
+        _json_value(window)
+
+
+def _current_fingerprint(path: Path) -> dict[str, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
 class ProcessingWorker(QThread):
-    progress = Signal(int, int, str)
+    progress = Signal(int, int, int, str)
     analysis_ready = Signal(int, object)
     timing_configured = Signal(object, str)
     stage_progress = Signal(int, str, float, float)
 
-    def __init__(self, files, input_root, output_root, device_choice, compute_type, beam_size, tone_enabled=None):
+    def __init__(
+        self,
+        files,
+        input_root,
+        output_root,
+        device_choice,
+        compute_type,
+        beam_size,
+        tone_enabled=None,
+        row_indices=None,
+    ):
         super().__init__()
         self.files = list(files)
+        self.row_indices = list(row_indices) if row_indices is not None else list(range(len(self.files)))
+        if len(self.row_indices) != len(self.files):
+            raise ValueError("row_indices must map every worker file to an existing queue row")
         self.input_root = Path(input_root).resolve() if input_root else None
         self.output_root = Path(output_root).resolve()
         self.device_choice = device_choice
@@ -96,7 +218,8 @@ class ProcessingWorker(QThread):
                 tone_enabled=self.tone_enabled,
             )
             total = len(self.files)
-            for index, path in enumerate(self.files, 1):
+            for work_index, path in enumerate(self.files):
+                row = self.row_indices[work_index]
                 source = Path(path).resolve()
                 if self.input_root:
                     try:
@@ -114,28 +237,38 @@ class ProcessingWorker(QThread):
                         status="cancelled",
                         error="在开始前取消。",
                     )
-                    self.analysis_ready.emit(index - 1, analysis)
-                    completed_indices.add(index - 1)
+                    self.analysis_ready.emit(row, analysis)
+                    completed_indices.add(work_index)
                     continue
 
-                self.progress.emit(index, total, f"[{index}/{total}] 正在处理：{source.name}")
+                current = work_index + 1
+                self.progress.emit(current, total, row, f"[{current}/{total}] 正在处理：{source.name}")
+                initial_fingerprint = _current_fingerprint(source)
                 analysis = pipeline.analyze_file(
                     source,
                     destination,
                     cancel_event=self.cancel_event,
-                    progress=lambda stage, i=index, t=total: self.progress.emit(
-                        i, t, f"[{i}/{t}] {stage}"
+                    progress=lambda stage, i=current, t=total, r=row: self.progress.emit(
+                        i, t, r, f"[{i}/{t}] {stage}"
                     ),
-                    stage_progress=lambda stage, fraction, seconds, row=index - 1:
-                        self.stage_progress.emit(row, stage, fraction, seconds),
+                    stage_progress=lambda stage, fraction, seconds, queue_row=row:
+                        self.stage_progress.emit(queue_row, stage, fraction, seconds),
                 )
-                self.analysis_ready.emit(index - 1, analysis)
-                completed_indices.add(index - 1)
+                analysis.profile = profile
+                final_fingerprint = _current_fingerprint(source)
+                if initial_fingerprint is not None:
+                    analysis.source_size_bytes = initial_fingerprint["size_bytes"]
+                    analysis.source_mtime_ns = initial_fingerprint["mtime_ns"]
+                if initial_fingerprint != final_fingerprint:
+                    analysis.source_changed = True
+                self.analysis_ready.emit(row, analysis)
+                completed_indices.add(work_index)
         except Exception as exc:
             # Unexpected queue-level errors are reported as failed items, never as success.
-            for index, path in enumerate(self.files):
-                if index in completed_indices:
+            for work_index, path in enumerate(self.files):
+                if work_index in completed_indices:
                     continue
+                row = self.row_indices[work_index]
                 try:
                     source = Path(path).resolve()
                 except (OSError, RuntimeError, ValueError):
@@ -146,8 +279,8 @@ class ProcessingWorker(QThread):
                     status="failed",
                     error=f"处理队列失败：{type(exc).__name__}: {str(exc)[:500]}",
                 )
-                self.analysis_ready.emit(index, analysis)
-                completed_indices.add(index)
+                self.analysis_ready.emit(row, analysis)
+                completed_indices.add(work_index)
 
 
 class MainWindow(QMainWindow):
@@ -155,6 +288,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         application = QApplication.instance()
         if application is not None:
+            application.setApplicationName("ConsultASR")
+            application.setOrganizationName("ConsultASR")
             _configure_application_fonts(application)
         self.setWindowTitle("咨询录音转写")
         self.resize(1160, 760)
@@ -166,6 +301,43 @@ class MainWindow(QMainWindow):
         self.role_choices: dict[str, str | None] = {}
         self._updating_role = False
         self._close_when_done = False
+        self._session_error = ""
+        self._session_notice = ""
+        self._session_ready_count = 0
+        self._session_root = Path(
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+            or (Path.home() / ".local" / "share" / "ConsultASR")
+        )
+        self._session_path = self._session_root / "session.json"
+        self._session_store = AtomicJsonStore(self._session_path)
+        self._eta_index_by_row: dict[int, int] = {}
+        self._active_worker_rows: list[int] = []
+        self._stale_results: dict[int, FileAnalysis] = {}
+        self._sentence_ids_by_row: dict[int, list[str]] = {}
+        self._selected_sentence_id: str | None = None
+        self._editor_row: int | None = None
+        self._suppress_sentence_events = False
+        self._media_player = None
+        self._audio_output = None
+        self._audio_unavailable_reason = ""
+        self._media_source_path: Path | None = None
+        self._pending_play_request: tuple[Path, str, int, int, int] | None = None
+        self._play_generation = 0
+        self._started_play_generation: int | None = None
+        self._media_source_fingerprint: dict[str, int] | None = None
+        try:
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+            self._audio_output = QAudioOutput(self)
+            self._media_player = QMediaPlayer(self)
+            self._media_player.setAudioOutput(self._audio_output)
+            self._media_player.positionChanged.connect(self._media_position_changed)
+            self._media_player.mediaStatusChanged.connect(self._media_status_changed)
+            self._media_player.errorOccurred.connect(self._media_error)
+        except Exception as exc:
+            self._media_player = None
+            self._audio_output = None
+            self._audio_unavailable_reason = type(exc).__name__
         self._time_estimator = TimeEstimator()
         self._timing_profile: str | None = None
         self._timing_settings = QSettings("ConsultASR", "LocalTiming")
@@ -325,6 +497,53 @@ class MainWindow(QMainWindow):
         self.preview.setMinimumHeight(112)
         review_layout.addWidget(self.preview, 1)
 
+        correction_box = QGroupBox("逐句校对与回听")
+        correction_layout = QVBoxLayout(correction_box)
+        correction_layout.setContentsMargins(8, 9, 8, 7)
+        correction_layout.setSpacing(5)
+        sentence_row = QHBoxLayout()
+        self.sentence_combo = QComboBox()
+        self.sentence_combo.setObjectName("sageCombo")
+        self.sentence_combo.currentIndexChanged.connect(self._sentence_selected)
+        sentence_row.addWidget(self.sentence_combo, 1)
+        self.play_sentence_button = QPushButton("回听句子")
+        self.play_sentence_button.setObjectName("secondaryButton")
+        self.play_sentence_button.clicked.connect(self._play_selected_sentence)
+        sentence_row.addWidget(self.play_sentence_button)
+        self.stop_audio_button = QPushButton("停止")
+        self.stop_audio_button.setObjectName("quietButton")
+        self.stop_audio_button.clicked.connect(self._stop_playback)
+        sentence_row.addWidget(self.stop_audio_button)
+        correction_layout.addLayout(sentence_row)
+
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(QLabel("说话人"))
+        self.sentence_speaker_combo = QComboBox()
+        self.sentence_speaker_combo.addItem("保持自动识别", None)
+        self.sentence_speaker_combo.addItem("说话人 1", "speaker_1")
+        self.sentence_speaker_combo.addItem("说话人 2", "speaker_2")
+        self.sentence_speaker_combo.currentIndexChanged.connect(self._sentence_edit_changed)
+        edit_row.addWidget(self.sentence_speaker_combo, 1)
+        self.save_correction_button = QPushButton("保存校对")
+        self.save_correction_button.setObjectName("secondaryButton")
+        self.save_correction_button.setEnabled(False)
+        self.save_correction_button.clicked.connect(self._save_sentence_correction)
+        edit_row.addWidget(self.save_correction_button)
+        correction_layout.addLayout(edit_row)
+
+        self.sentence_editor = QPlainTextEdit()
+        self.sentence_editor.setPlaceholderText("可修订当前句子的文字；原始识别文本和时间戳会保留。")
+        self.sentence_editor.setMaximumHeight(76)
+        self.sentence_editor.textChanged.connect(self._sentence_edit_changed)
+        correction_layout.addWidget(self.sentence_editor)
+        self.sentence_precision_note = QLabel(
+            "回听按识别时间范围定位；同一识别词内拆出的句子可能共用时间范围。"
+        )
+        self.sentence_precision_note.setObjectName("mutedLabel")
+        self.sentence_precision_note.setWordWrap(True)
+        correction_layout.addWidget(self.sentence_precision_note)
+        review_layout.addWidget(correction_box)
+
         role_row = QHBoxLayout()
         role_row.addWidget(QLabel("角色确认"))
         self.role_combo = _SageRoleComboBox()
@@ -372,6 +591,7 @@ class MainWindow(QMainWindow):
         output_layout.addWidget(QLabel("保存到"))
         self.output_edit = QLineEdit(str(OUTPUT_DIR))
         self.output_edit.setToolTip("结果保存到此文件夹；Word 与 JSON 会成对保存。")
+        self.output_edit.editingFinished.connect(self._persist_session)
         output_layout.addWidget(self.output_edit, 1)
         choose_output = QPushButton("更改…")
         choose_output.setObjectName("secondaryButton")
@@ -453,6 +673,7 @@ class MainWindow(QMainWindow):
         self._show_selected_analysis()
         self._refresh_model_state()
         self._update_counts()
+        self._restore_session()
 
     def _reset_time_estimate(self):
         self._timing_timer.stop()
@@ -469,10 +690,6 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError):
             rates = []
         self._time_estimator.configure(durations, rates)
-        self._update_time_estimate()
-
-    def _stage_timing(self, row, stage, fraction, audio_seconds):
-        self._time_estimator.progress(row, stage, fraction, audio_seconds)
         self._update_time_estimate()
 
     def _update_time_estimate(self):
@@ -557,11 +774,15 @@ class MainWindow(QMainWindow):
         self._set_inputs(files, root)
 
     def _set_inputs(self, files, root):
+        self._stop_playback(clear_source=True)
+        self._delete_session_file()
         self._reset_time_estimate()
         unique = sorted({Path(item).resolve() for item in files}, key=lambda item: str(item).casefold())
         self.input_files = unique
         self.input_root = Path(root).resolve() if root else None
         self.analyses = [None] * len(unique)
+        self._stale_results.clear()
+        self._session_ready_count = 0
         self.role_choices.clear()
         self.table.setRowCount(len(unique))
         for row, path in enumerate(unique):
@@ -573,6 +794,7 @@ class MainWindow(QMainWindow):
             self._set_queue_status(row, "pending", "待处理")
             self._set_queue_detail(row, "尚未处理")
         self.source_summary.setText(f"{len(unique)} 项")
+        self.start_button.setText("开始处理")
         self.queue_empty.setVisible(not unique)
         self.table.setVisible(bool(unique))
         if unique:
@@ -580,14 +802,20 @@ class MainWindow(QMainWindow):
         self.preview.clear()
         self._update_counts()
         self._show_selected_analysis()
+        self._persist_session()
 
     def _clear_queue(self):
         if self.worker and self.worker.isRunning():
             return
+        self._stop_playback(clear_source=True)
         self._reset_time_estimate()
         self.input_files = []
         self.input_root = None
         self.analyses = []
+        self._stale_results.clear()
+        self.role_choices.clear()
+        self._sentence_ids_by_row.clear()
+        self._delete_session_file()
         self.table.setRowCount(0)
         self.source_summary.setText("0 项")
         self.queue_empty.show()
@@ -595,6 +823,429 @@ class MainWindow(QMainWindow):
         self.preview.clear()
         self._update_counts()
         self._show_selected_analysis()
+
+    def _delete_session_file(self):
+        try:
+            self._session_path.unlink(missing_ok=True)
+        except OSError:
+            self._session_notice = "本地恢复记录未能清除。"
+
+    def _analysis_to_record(self, result: FileAnalysis | None) -> dict | None:
+        if result is None or result.status not in _RESTORABLE_STATUSES:
+            return None
+        error = str(result.error or "")
+        for private_path in (result.input_path, result.output_dir):
+            if private_path:
+                error = error.replace(str(private_path), "[本地路径]")
+        record = {
+            "input_path": str(result.input_path),
+            "output_dir": str(result.output_dir),
+            "status": result.status,
+            "words": result.words,
+            "segments": result.segments,
+            "duration_seconds": result.duration_seconds,
+            "elapsed_seconds": result.elapsed_seconds,
+            "error": error[:500],
+            "word_path": str(result.word_path) if result.word_path else None,
+            "json_path": str(result.json_path) if result.json_path else None,
+            "roles_confirmed": bool(result.roles_confirmed),
+            "counselor_speaker": result.counselor_speaker,
+            "emotion_windows": result.emotion_windows,
+            "analysis_windows": result.analysis_windows,
+            "tone_enabled": result.tone_enabled,
+            "tone_model": result.tone_model,
+            "tone_status": result.tone_status,
+            "tone_error": str(result.tone_error or "")[:500],
+            "sentence_revisions": result.sentence_revisions,
+            "revision": result.revision,
+            "exported_revision": result.exported_revision,
+            "profile": result.profile,
+            "source_size_bytes": result.source_size_bytes,
+            "source_mtime_ns": result.source_mtime_ns,
+            "source_changed": bool(result.source_changed),
+        }
+        return _json_value(record)
+
+    def _analysis_from_record(self, record: dict, expected_path: Path) -> FileAnalysis:
+        if not isinstance(record, dict):
+            raise ValueError("缓存结果结构无效")
+        stored_path = record.get("input_path")
+        output_text = record.get("output_dir")
+        status = record.get("status")
+        if (
+            not isinstance(stored_path, str)
+            or len(stored_path) > 4096
+            or not isinstance(output_text, str)
+            or len(output_text) > 4096
+        ):
+            raise ValueError("缓存路径无效")
+        if Path(stored_path).expanduser().resolve(strict=False) != expected_path.resolve(strict=False):
+            raise ValueError("缓存队列映射无效")
+        if status not in _RESTORABLE_STATUSES:
+            raise ValueError("缓存状态无效")
+
+        words = record.get("words", [])
+        segments = record.get("segments", [])
+        if not isinstance(words, list) or len(words) > _MAX_SESSION_WORDS:
+            raise ValueError("缓存词级结果无效")
+        if not isinstance(segments, list) or len(segments) > _MAX_SESSION_WORDS:
+            raise ValueError("缓存片段结果无效")
+        for word in words:
+            if not isinstance(word, dict):
+                raise ValueError("缓存词级结果无效")
+            start, end, text = word.get("start"), word.get("end"), word.get("text")
+            if not _valid_optional_number(start, minimum=0) or not _valid_optional_number(end, minimum=0):
+                raise ValueError("缓存时间戳无效")
+            if start is None or end is None or end < start or not isinstance(text, str):
+                raise ValueError("缓存词级结果无效")
+            if word.get("speaker_id") not in {None, "speaker_1", "speaker_2"}:
+                raise ValueError("缓存说话人无效")
+            if "uncertain" in word and not isinstance(word["uncertain"], bool):
+                raise ValueError("缓存词级置信标记无效")
+        for segment in segments:
+            if not isinstance(segment, dict):
+                raise ValueError("缓存说话人片段无效")
+            start, end = segment.get("start"), segment.get("end")
+            if (
+                not _valid_optional_number(start, minimum=0)
+                or not _valid_optional_number(end, minimum=0)
+                or start is None
+                or end is None
+                or end < start
+                or not isinstance(segment.get("text", ""), str)
+                or segment.get("speaker_id") not in {None, "speaker_1", "speaker_2"}
+            ):
+                raise ValueError("缓存说话人片段无效")
+        duration = record.get("duration_seconds")
+        elapsed = record.get("elapsed_seconds", 0)
+        if not _valid_optional_number(duration, minimum=0) or not _valid_optional_number(elapsed, minimum=0):
+            raise ValueError("缓存时长无效")
+
+        revisions = record.get("sentence_revisions", {})
+        base_sentence_ids = {
+            make_sentence_id(index, item["start"], item["end"])
+            for index, item in enumerate(build_sentences(words))
+        }
+        if not isinstance(revisions, dict) or len(revisions) > len(base_sentence_ids):
+            raise ValueError("缓存校对记录无效")
+        for sentence_key, override in revisions.items():
+            if (
+                not isinstance(sentence_key, str)
+                or len(sentence_key) > 256
+                or sentence_key not in base_sentence_ids
+                or not isinstance(override, dict)
+            ):
+                raise ValueError("缓存校对记录无效")
+            if "text" in override and (not isinstance(override["text"], str) or len(override["text"]) > 100_000):
+                raise ValueError("缓存校对文本无效")
+            if override.get("speaker_id") not in {None, "speaker_1", "speaker_2"}:
+                raise ValueError("缓存校对说话人无效")
+
+        word_path_text, json_path_text = record.get("word_path"), record.get("json_path")
+        if (word_path_text is None) != (json_path_text is None):
+            raise ValueError("缓存导出配对无效")
+        if any(
+            value is not None and (not isinstance(value, str) or len(value) > 4096)
+            for value in (word_path_text, json_path_text)
+        ):
+            raise ValueError("缓存导出路径无效")
+        word_path = Path(word_path_text).expanduser().resolve(strict=False) if word_path_text else None
+        json_path = Path(json_path_text).expanduser().resolve(strict=False) if json_path_text else None
+        output_dir = Path(output_text).expanduser().resolve(strict=False)
+        if word_path is not None and json_path is not None:
+            if (
+                word_path.parent != output_dir
+                or json_path.parent != output_dir
+                or word_path.suffix.casefold() != ".docx"
+                or json_path.suffix.casefold() != ".json"
+                or word_path.stem.casefold() != json_path.stem.casefold()
+            ):
+                raise ValueError("缓存导出配对无效")
+
+        revision = record.get("revision", 0)
+        exported_revision = record.get("exported_revision", -1)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("缓存修订号无效")
+        if isinstance(exported_revision, bool) or not isinstance(exported_revision, int) or exported_revision < -1:
+            raise ValueError("缓存导出修订号无效")
+        source_size = record.get("source_size_bytes")
+        source_mtime = record.get("source_mtime_ns")
+        if (source_size is None) != (source_mtime is None):
+            raise ValueError("缓存源文件指纹无效")
+        for fingerprint_value in (source_size, source_mtime):
+            if fingerprint_value is not None and (
+                isinstance(fingerprint_value, bool)
+                or not isinstance(fingerprint_value, int)
+                or fingerprint_value < 0
+            ):
+                raise ValueError("缓存源文件指纹无效")
+
+        result = FileAnalysis(expected_path, output_dir, status)
+        result.words = words
+        result.segments = segments
+        result.duration_seconds = duration
+        result.elapsed_seconds = elapsed
+        result.error = str(record.get("error", ""))[:500]
+        result.word_path = word_path
+        result.json_path = json_path
+        result.roles_confirmed = record.get("roles_confirmed") is True
+        counselor = record.get("counselor_speaker")
+        if counselor not in {None, "speaker_1", "speaker_2"}:
+            raise ValueError("缓存角色无效")
+        result.counselor_speaker = counselor
+        emotion_windows = record.get("emotion_windows")
+        analysis_windows = record.get("analysis_windows", [])
+        if emotion_windows is not None:
+            _validate_window_records(emotion_windows, "情绪窗口")
+        _validate_window_records(analysis_windows, "声学窗口")
+        result.emotion_windows = emotion_windows
+        result.analysis_windows = analysis_windows
+        tone_enabled = record.get("tone_enabled")
+        if tone_enabled not in {None, True, False}:
+            raise ValueError("缓存情绪设置无效")
+        result.tone_enabled = tone_enabled
+        tone_model = record.get("tone_model")
+        if tone_model is not None and not isinstance(tone_model, dict):
+            raise ValueError("缓存模型信息无效")
+        result.tone_model = tone_model
+        tone_status = record.get("tone_status")
+        if tone_status is not None and not isinstance(tone_status, str):
+            raise ValueError("缓存情绪状态无效")
+        result.tone_status = tone_status
+        result.tone_error = str(record.get("tone_error", ""))[:500]
+        result.sentence_revisions = revisions
+        result.revision = revision
+        result.exported_revision = exported_revision
+        profile = record.get("profile")
+        if profile is not None and (not isinstance(profile, str) or len(profile) > 256):
+            raise ValueError("缓存处理配置无效")
+        result.profile = profile
+        result.source_size_bytes = source_size
+        result.source_mtime_ns = source_mtime
+        source_changed = record.get("source_changed", False)
+        if not isinstance(source_changed, bool):
+            raise ValueError("缓存源文件状态无效")
+        result.source_changed = source_changed
+        return result
+
+    def _restore_session(self):
+        try:
+            payload = self._session_store.read()
+        except ResultStoreError:
+            self._session_error = "本地恢复记录损坏或过大；旧内容未载入，仍可重新选择音频继续处理。"
+            self.progress_label.setText(self._session_error)
+            return
+        if payload is None:
+            return
+        try:
+            if payload.get("schema_version") != _SESSION_SCHEMA_VERSION:
+                raise ValueError("缓存版本不支持")
+            files = payload.get("input_files")
+            records = payload.get("analyses")
+            fingerprints = payload.get("fingerprints")
+            if not isinstance(files, list) or not isinstance(records, list) or not isinstance(fingerprints, list):
+                raise ValueError("缓存队列结构无效")
+            if len(files) > _MAX_SESSION_FILES or len(records) != len(files) or len(fingerprints) != len(files):
+                raise ValueError("缓存队列数量无效")
+            input_files = []
+            for value in files:
+                if not isinstance(value, str) or len(value) > 4096:
+                    raise ValueError("缓存音频路径无效")
+                input_files.append(Path(value).expanduser().resolve(strict=False))
+            if len({str(path).casefold() for path in input_files}) != len(input_files):
+                raise ValueError("缓存队列存在重复音频")
+            input_root_value = payload.get("input_root")
+            output_root_value = payload.get("output_root")
+            if input_root_value is not None and not isinstance(input_root_value, str):
+                raise ValueError("缓存输入目录无效")
+            if not isinstance(output_root_value, str) or len(output_root_value) > 4096:
+                raise ValueError("缓存输出目录无效")
+            input_root = Path(input_root_value).expanduser().resolve(strict=False) if input_root_value else None
+            output_root = Path(output_root_value).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            self._session_error = "本地恢复记录格式无效；旧内容未载入，仍可重新选择音频继续处理。"
+            self.progress_label.setText(self._session_error)
+            return
+
+        analyses = []
+        normalized_fingerprints = []
+        restored_count = 0
+        invalid_rows = set()
+        for row, (path, record, fingerprint) in enumerate(zip(input_files, records, fingerprints)):
+            valid_fingerprint = fingerprint
+            if fingerprint is not None and (
+                not isinstance(fingerprint, dict)
+                or isinstance(fingerprint.get("size_bytes"), bool)
+                or not isinstance(fingerprint.get("size_bytes"), int)
+                or fingerprint["size_bytes"] < 0
+                or isinstance(fingerprint.get("mtime_ns"), bool)
+                or not isinstance(fingerprint.get("mtime_ns"), int)
+                or fingerprint["mtime_ns"] < 0
+            ):
+                valid_fingerprint = None
+                invalid_rows.add(row)
+            normalized_fingerprints.append(valid_fingerprint)
+            try:
+                analysis = self._analysis_from_record(record, path) if record is not None else None
+            except (OSError, RuntimeError, TypeError, ValueError, KeyError, OverflowError):
+                analysis = None
+                invalid_rows.add(row)
+            if analysis is not None:
+                expected_fingerprint = valid_fingerprint
+                if analysis.source_size_bytes is not None and analysis.source_mtime_ns is not None:
+                    expected_fingerprint = {
+                        "size_bytes": analysis.source_size_bytes,
+                        "mtime_ns": analysis.source_mtime_ns,
+                    }
+                current = _current_fingerprint(path)
+                if current is None or expected_fingerprint is None or current != expected_fingerprint:
+                    analysis.source_changed = True
+                if analysis.status == "exported":
+                    pair_exists = bool(
+                        analysis.word_path
+                        and analysis.json_path
+                        and analysis.word_path.is_file()
+                        and analysis.json_path.is_file()
+                        and analysis.exported_revision == analysis.revision
+                    )
+                    if not pair_exists:
+                        analysis.status = "no_speech" if not analysis.words else "ready"
+                        analysis.error = "上次导出文件缺失或版本已变化，请重新保存。"
+                restored_count += 1
+            analyses.append(analysis)
+
+        try:
+            role_choices = payload.get("role_choices", {})
+            normalized_roles = {}
+            allowed_paths = {str(path) for path in input_files}
+            if isinstance(role_choices, dict):
+                for path_text, speaker in role_choices.items():
+                    if (
+                        isinstance(path_text, str)
+                        and path_text in allowed_paths
+                        and (
+                            speaker is None
+                            or (isinstance(speaker, str) and speaker in {"speaker_1", "speaker_2"})
+                        )
+                    ):
+                        normalized_roles[path_text] = speaker
+            stale_records = payload.get("stale_results", [])
+            stale_results = {}
+            if isinstance(stale_records, list):
+                for entry in stale_records[:len(input_files)]:
+                    if not isinstance(entry, dict):
+                        continue
+                    row = entry.get("row")
+                    if (
+                        isinstance(row, bool)
+                        or not isinstance(row, int)
+                        or not 0 <= row < len(input_files)
+                        or row in stale_results
+                    ):
+                        continue
+                    try:
+                        stale_results[row] = self._analysis_from_record(entry.get("analysis"), input_files[row])
+                    except (OSError, RuntimeError, TypeError, ValueError, KeyError, OverflowError):
+                        continue
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError):
+            normalized_roles = {}
+            stale_results = {}
+
+        self.input_files = input_files
+        self.input_root = input_root
+        self.analyses = analyses
+        self.role_choices = normalized_roles
+        self._stale_results = stale_results
+        self.output_edit.setText(str(output_root))
+        self.table.setRowCount(len(input_files))
+        changed_count = 0
+        for row, path in enumerate(input_files):
+            name_item = QTableWidgetItem(path.name)
+            name_item.setToolTip(str(path))
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, QTableWidgetItem())
+            self.table.setItem(row, 2, QTableWidgetItem())
+            result = analyses[row]
+            fingerprint = normalized_fingerprints[row]
+            if result is None:
+                current = _current_fingerprint(path)
+                changed = current is None or fingerprint is None or current != fingerprint
+                if changed:
+                    changed_count += 1
+                    self._set_queue_status(row, "warning", "源文件待检查")
+                    detail = "源音频不存在或已变化；处理时将使用当前文件。"
+                else:
+                    self._set_queue_status(row, "pending", "待处理")
+                    detail = "上次未完成；可继续处理。"
+                if row in invalid_rows:
+                    detail = "本行恢复记录无效，需重新处理。 " + detail
+                self._set_queue_detail(row, detail)
+            elif result.source_changed:
+                changed_count += 1
+                self._set_queue_status(row, "warning", "音频已变化")
+                self._set_queue_detail(row, "旧结果与校对已保留；请重新处理当前音频版本。")
+            else:
+                status_text, tone = _analysis_status(result)
+                self._set_queue_status(row, tone, status_text)
+                detail = f"已恢复 {len(result.words)} 个时间片段"
+                if result.status == "ready" and result.exported_revision != result.revision:
+                    detail += " · 可重新导出"
+                self._set_queue_detail(row, detail)
+        self.source_summary.setText(f"{len(input_files)} 项")
+        self.queue_empty.setVisible(not input_files)
+        self.table.setVisible(bool(input_files))
+        if input_files:
+            self.table.selectRow(0)
+        pending_count = sum(
+            1 for result in analyses
+            if result is None or result.status in {"failed", "cancelled"} or result.source_changed
+        )
+        self._session_ready_count = restored_count
+        self.progress_label.setText(f"已恢复 {restored_count} 个完成结果，剩余 {pending_count} 个文件。")
+        self.start_button.setText("继续处理" if pending_count else "开始处理")
+        self._update_counts()
+        self._show_selected_analysis()
+        if invalid_rows:
+            self._session_notice = f"{len(invalid_rows)} 个队列项的恢复记录无效；这些项目已保留为待处理状态。"
+        elif changed_count:
+            self._session_notice = f"其中 {changed_count} 个源文件已变化或不可用；旧的已完成结果保留在本地会话中。"
+
+    def _persist_session(self):
+        if not self.input_files:
+            self._delete_session_file()
+            return
+        analyses = self.analyses
+        if len(analyses) != len(self.input_files):
+            return
+        fingerprints = []
+        for row, path in enumerate(self.input_files):
+            result = analyses[row]
+            if result is not None and result.source_size_bytes is not None and result.source_mtime_ns is not None:
+                fingerprints.append({"size_bytes": result.source_size_bytes, "mtime_ns": result.source_mtime_ns})
+            else:
+                fingerprints.append(_current_fingerprint(path))
+        stale_results = [
+            {"row": row, "analysis": self._analysis_to_record(result)}
+            for row, result in self._stale_results.items()
+            if 0 <= row < len(self.input_files) and self._analysis_to_record(result) is not None
+        ]
+        payload = {
+            "schema_version": _SESSION_SCHEMA_VERSION,
+            "input_files": [str(path) for path in self.input_files],
+            "input_root": str(self.input_root) if self.input_root else None,
+            "output_root": str(Path(self.output_edit.text()).expanduser().resolve(strict=False)),
+            "fingerprints": fingerprints,
+            "analyses": [self._analysis_to_record(result) for result in analyses],
+            "role_choices": self.role_choices,
+            "stale_results": stale_results,
+        }
+        try:
+            self._session_store.write(_json_value(payload))
+        except (ResultStoreError, OSError, TypeError, ValueError):
+            self._session_error = "本地恢复记录未能保存；当前处理仍可继续，请及时导出 Word + JSON。"
+            if not getattr(self, "_session_warning_shown", False):
+                self._session_warning_shown = True
+                QMessageBox.warning(self, "本地恢复未保存", self._session_error)
 
     def _choose_output(self):
         path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.output_edit.text())
@@ -635,22 +1286,37 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "保存目录冲突", "请为结果选择与源音频不同的保存目录。")
             return
 
-        self.analyses = [None] * len(self.input_files)
-        self.role_choices.clear()
-        for row in range(len(self.input_files)):
+        pending_rows = [
+            row
+            for row, result in enumerate(self.analyses)
+            if result is None
+            or result.status in {"failed", "cancelled"}
+            or bool(getattr(result, "source_changed", False))
+        ]
+        if not pending_rows:
+            QMessageBox.information(self, "队列已完成", "没有需要重新处理的文件；如需补存结果，请使用“保存 Word + JSON”。")
+            return
+        for row in pending_rows:
+            if self.analyses[row] is not None:
+                stale = self.analyses[row]
+                if getattr(stale, "source_changed", False):
+                    self._stale_results[row] = copy.deepcopy(stale)
+                elif stale.status in {"failed", "cancelled"}:
+                    self.analyses[row] = None
             self._set_queue_status(row, "pending", "待处理")
-            self._set_queue_detail(row, "尚未处理")
+            self._set_queue_detail(row, "尚未处理" if self.analyses[row] is None else "使用当前音频版本重新处理；旧结果已保留在本地会话备份")
         device_choice = self.device_combo.currentData() if self.advanced_toggle.isChecked() else "auto"
         compute_type = self.compute_combo.currentData() if self.advanced_toggle.isChecked() else "float16"
         beam_size = self.beam_spin.value() if self.advanced_toggle.isChecked() else 5
         self.worker = ProcessingWorker(
-            self.input_files,
+            [self.input_files[row] for row in pending_rows],
             self.input_root,
             output_root,
             device_choice,
             compute_type,
             beam_size,
             self.tone_enabled_check.isChecked(),
+            row_indices=pending_rows,
         )
         self.worker.progress.connect(self._progress)
         self.worker.analysis_ready.connect(self._analysis_ready)
@@ -665,9 +1331,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_label.setText("正在准备处理队列…")
         self._timing_profile = None
-        self._time_estimator.start(len(self.input_files))
+        self._active_worker_rows = list(pending_rows)
+        self._eta_index_by_row = {row: index for index, row in enumerate(pending_rows)}
+        self._time_estimator.start(len(pending_rows))
         self._timing_timer.start()
         self._update_time_estimate()
+        self._persist_session()
         self.worker.start()
 
     def _cancel(self):
@@ -677,11 +1346,12 @@ class MainWindow(QMainWindow):
             self.progress_label.setText("已请求取消；将于当前安全处理边界停止。")
             self._update_time_estimate()
 
-    def _progress(self, current, total, message):
+    def _progress(self, current, total, row, message):
         self.progress_label.setText(message)
         self.progress_bar.setValue(int((current - 1) / max(total, 1) * 100))
-        row = current - 1
-        if 0 <= row < len(self.analyses) and self.analyses[row] is None:
+        if 0 <= row < len(self.analyses) and (
+            self.analyses[row] is None or row in self._active_worker_rows
+        ):
             detail = message.split("] ", 1)[-1]
             self._set_queue_status(row, "processing", "处理中")
             self._set_queue_detail(row, detail)
@@ -694,7 +1364,9 @@ class MainWindow(QMainWindow):
             return
         self.analyses[row] = result
         learn_timing = result.status == "ready" and bool(result.words) and result.tone_status not in {"failed", "partial"}
-        self._time_estimator.complete(row, result.duration_seconds, result.elapsed_seconds, learn_timing)
+        eta_row = self._eta_index_by_row.get(row)
+        if eta_row is not None:
+            self._time_estimator.complete(eta_row, result.duration_seconds, result.elapsed_seconds, learn_timing)
         if learn_timing and self._timing_profile:
             self._timing_settings.setValue(f"rates/{self._timing_profile}", json.dumps(self._time_estimator.rates))
             self._timing_settings.sync()
@@ -705,9 +1377,19 @@ class MainWindow(QMainWindow):
         if result.tone_status in {"failed", "partial"} and result.tone_error:
             detail += f" · 情绪分析：{result.tone_error[:180]}"
         self._set_queue_detail(row, detail)
+        if result.source_changed:
+            self._set_queue_status(row, "warning", "音频已变化")
+            self._set_queue_detail(row, "处理期间源文件发生变化；此结果保留，请重新处理后再导出。")
         self._update_counts()
+        self._persist_session()
         if self.table.currentRow() == row:
             self._show_selected_analysis()
+
+    def _stage_timing(self, row, stage, fraction, audio_seconds):
+        eta_row = self._eta_index_by_row.get(row)
+        if eta_row is not None:
+            self._time_estimator.progress(eta_row, stage, fraction, audio_seconds)
+            self._update_time_estimate()
 
     def _set_queue_status(self, row: int, tone: str, text: str):
         item = self.table.item(row, 1)
@@ -759,6 +1441,12 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(
             f"{status}：完成 {done} · 失败 {failed} · 已取消 {stopped}。请检查各文件状态。"
         )
+        remaining = sum(
+            1 for result in self.analyses
+            if result is None or result.status in {"failed", "cancelled"} or result.source_changed
+        )
+        self.start_button.setText("继续处理" if remaining else "开始处理")
+        self._persist_session()
         self._refresh_model_state(preserve_status=True)
         if getattr(self, "_close_when_done", False):
             QTimer.singleShot(0, self.close)
@@ -777,9 +1465,323 @@ class MainWindow(QMainWindow):
         if row >= 0 and row < len(self.analyses):
             path = str(self.input_files[row])
             self.role_choices[path] = self.role_combo.currentData()
+            self._persist_session()
+
+    def _base_sentences(self, result: FileAnalysis) -> list[dict]:
+        return build_sentences(result.words, result.emotion_windows, result.tone_enabled)
+
+    def _populate_sentence_review(self, row: int, result: FileAnalysis):
+        base = self._base_sentences(result)
+        previous_id = self._selected_sentence_id if self._editor_row == row else None
+        ids = [make_sentence_id(index, item["start"], item["end"]) for index, item in enumerate(base)]
+        self._sentence_ids_by_row[row] = ids
+        self._suppress_sentence_events = True
+        self.sentence_combo.clear()
+        for index, (sentence_id, item) in enumerate(zip(ids, base)):
+            start = max(0, int(float(item["start"])))
+            label = f"[{start // 60:02d}:{start % 60:02d}] {_speaker_label(item.get('speaker_id'))} · {item['text'][:54]}"
+            self.sentence_combo.addItem(label, sentence_id)
+        selected_index = ids.index(previous_id) if previous_id in ids else (0 if ids else -1)
+        if selected_index >= 0:
+            self.sentence_combo.setCurrentIndex(selected_index)
+        self._editor_row = row
+        self._selected_sentence_id = ids[selected_index] if selected_index >= 0 else None
+        self._load_sentence_editor(row, self._selected_sentence_id, base)
+        enabled = bool(base) and result.status in {"ready", "exported", "export_failed"} and not result.source_changed
+        self.sentence_combo.setEnabled(enabled)
+        self.sentence_editor.setEnabled(enabled)
+        self.sentence_speaker_combo.setEnabled(enabled)
+        self.save_correction_button.setEnabled(False)
+        self.play_sentence_button.setEnabled(enabled and self._media_player is not None)
+        self.stop_audio_button.setEnabled(self._media_player is not None)
+        if self._media_player is None:
+            self.sentence_precision_note.setText("当前环境无法启用本地回听；转写、校对和导出仍可使用。")
+        elif result.source_changed:
+            self.sentence_precision_note.setText("源音频已变化；旧结果与校对已保留，请先重新处理后再回听或导出。")
+        else:
+            self.sentence_precision_note.setText(
+                "编辑器按原始句完整校对；增加标点拆出的片段仍共享原时间范围。"
+                "回听按识别时间范围定位，同一识别词内拆出的句子可能共用时间范围。"
+            )
+        self._suppress_sentence_events = False
+
+    def _load_sentence_editor(self, row: int, sentence_id: str | None, base=None):
+        if not (0 <= row < len(self.analyses)) or self.analyses[row] is None or not sentence_id:
+            self._suppress_sentence_events = True
+            self.sentence_editor.clear()
+            self.sentence_speaker_combo.setCurrentIndex(0)
+            self._suppress_sentence_events = False
+            return
+        result = self.analyses[row]
+        sentences = base if base is not None else self._base_sentences(result)
+        sentence_index = next(
+            (index for index, item in enumerate(sentences)
+             if make_sentence_id(index, item["start"], item["end"]) == sentence_id),
+            None,
+        )
+        if sentence_index is None:
+            return
+        original = sentences[sentence_index]
+        override = result.sentence_revisions.get(sentence_id, {})
+        text = override.get("text", original["text"])
+        speaker = override.get("speaker_id")
+        self._suppress_sentence_events = True
+        self.sentence_editor.setPlainText(str(text))
+        combo_index = 0
+        if speaker in {"speaker_1", "speaker_2"}:
+            combo_index = 1 if speaker == "speaker_1" else 2
+        self.sentence_speaker_combo.setCurrentIndex(combo_index)
+        self._suppress_sentence_events = False
+        self._editor_original_text = str(text)
+        self._editor_original_speaker = original.get("speaker_id")
+
+    def _sentence_selected(self, index: int):
+        if self._suppress_sentence_events:
+            return
+        previous_id = self._selected_sentence_id
+        row = self._editor_row
+        if row is not None and previous_id:
+            self._save_sentence_correction(silent=True, row=row, sentence_id=previous_id, refresh=False)
+        self._stop_playback()
+        row = self.table.currentRow()
+        sentence_id = self.sentence_combo.itemData(index) if index >= 0 else None
+        self._selected_sentence_id = sentence_id
+        self._editor_row = row if row >= 0 else None
+        if row >= 0 and row < len(self.analyses) and self.analyses[row] is not None:
+            self._load_sentence_editor(row, sentence_id)
+        self.save_correction_button.setEnabled(False)
+
+    def _sentence_edit_changed(self, _value=None):
+        if self._suppress_sentence_events:
+            return
+        has_selection = self._editor_row is not None and bool(self._selected_sentence_id)
+        if not has_selection:
+            self.save_correction_button.setEnabled(False)
+            return
+        result = self.analyses[self._editor_row]
+        if result is None:
+            self.save_correction_button.setEnabled(False)
+            return
+        existing = result.sentence_revisions.get(self._selected_sentence_id, {})
+        saved_text = existing.get("text")
+        saved_speaker = existing.get("speaker_id")
+        current_text = self.sentence_editor.toPlainText()
+        current_speaker = self.sentence_speaker_combo.currentData()
+        if current_speaker == self._editor_original_speaker:
+            current_speaker = None
+        self.save_correction_button.setEnabled(
+            current_text != (saved_text if saved_text is not None else self._editor_original_text)
+            or current_speaker != saved_speaker
+        )
+
+    def _save_sentence_correction(
+        self,
+        *,
+        silent: bool = False,
+        row: int | None = None,
+        sentence_id: str | None = None,
+        refresh: bool = True,
+    ):
+        row = self._editor_row if row is None else row
+        sentence_id = self._selected_sentence_id if sentence_id is None else sentence_id
+        if row is None or not sentence_id or not 0 <= row < len(self.analyses):
+            return
+        result = self.analyses[row]
+        if result is None or result.status not in {"ready", "exported", "export_failed"}:
+            return
+        if row == self._editor_row and not self.save_correction_button.isEnabled():
+            return
+        text = self.sentence_editor.toPlainText().strip()
+        speaker = self.sentence_speaker_combo.currentData()
+        base = self._base_sentences(result)
+        original_index = next(
+            (index for index, item in enumerate(base)
+             if make_sentence_id(index, item["start"], item["end"]) == sentence_id),
+            None,
+        )
+        if original_index is None:
+            return
+        original = base[original_index]
+        override = {}
+        if text != original["text"]:
+            override["text"] = text
+        if speaker in {"speaker_1", "speaker_2"} and speaker != original.get("speaker_id"):
+            override["speaker_id"] = speaker
+        if override:
+            result.sentence_revisions[sentence_id] = override
+        else:
+            result.sentence_revisions.pop(sentence_id, None)
+        if result.status == "exported":
+            result.status = "ready"
+        result.revision += 1
+        result.error = ""
+        self._persist_session()
+        if refresh and self.table.currentRow() == row:
+            self._show_selected_analysis()
+        elif self.save_correction_button is not None:
+            self.save_correction_button.setEnabled(False)
+        if not silent:
+            self.progress_label.setText("已保存校对；原始识别文字和时间戳已保留，保存 Word + JSON 可同步导出修订。")
+
+    def _play_selected_sentence(self):
+        if self._media_player is None:
+            QMessageBox.information(self, "无法回听", "当前环境无法启用本地音频回听；转写仍可继续。")
+            return
+        row = self.table.currentRow()
+        sentence_id = self.sentence_combo.currentData()
+        if row < 0 or row >= len(self.analyses) or self.analyses[row] is None or not sentence_id:
+            return
+        result = self.analyses[row]
+        if result.source_changed:
+            QMessageBox.information(self, "源音频已变化", "旧转写仍已保留；请先重新处理当前音频后再回听。")
+            return
+        path = result.input_path.resolve(strict=False)
+        if not path.is_file():
+            QMessageBox.information(self, "找不到音频", "当前音频文件不可用；本地转写结果仍已保留。")
+            return
+        current_fingerprint = _current_fingerprint(path)
+        expected_fingerprint = None
+        if result.source_size_bytes is not None and result.source_mtime_ns is not None:
+            expected_fingerprint = {
+                "size_bytes": result.source_size_bytes,
+                "mtime_ns": result.source_mtime_ns,
+            }
+        if current_fingerprint is None or (
+            expected_fingerprint is not None and current_fingerprint != expected_fingerprint
+        ):
+            result.source_changed = True
+            self._persist_session()
+            self._show_selected_analysis()
+            QMessageBox.information(self, "源音频已变化", "旧转写仍已保留；当前文件与处理时的音频版本不同，请先重新处理。")
+            return
+        base = self._base_sentences(result)
+        sentence = next(
+            (item for index, item in enumerate(base)
+             if make_sentence_id(index, item["start"], item["end"]) == sentence_id),
+            None,
+        )
+        if sentence is None:
+            return
+        start_ms = max(0, int(round(float(sentence["start"]) * 1000)))
+        end_ms = max(start_ms + 120, int(round(float(sentence["end"]) * 1000)))
+        if result.duration_seconds is not None:
+            end_ms = min(end_ms, int(round(result.duration_seconds * 1000)))
+        self._play_generation += 1
+        generation = self._play_generation
+        self._pending_play_request = (path, sentence_id, start_ms, end_ms, generation)
+        source_changed = (
+            path != self._media_source_path
+            or current_fingerprint != self._media_source_fingerprint
+        )
+        if source_changed:
+            self._media_player.stop()
+            self._started_play_generation = None
+            self._media_source_path = path
+            self._media_source_fingerprint = current_fingerprint
+            self._media_player.setSource(QUrl.fromLocalFile(str(path)))
+            return
+        self._begin_pending_play()
+
+    def _begin_pending_play(self):
+        request = self._pending_play_request
+        if request is None or self._media_player is None:
+            return
+        path, sentence_id, start_ms, _end_ms, generation = request
+        if self._started_play_generation == generation:
+            return
+        row = self.table.currentRow()
+        if (
+            generation != self._play_generation
+            or path != self._media_source_path
+            or row < 0
+            or row >= len(self.input_files)
+            or self.input_files[row].resolve(strict=False) != path
+            or self.sentence_combo.currentData() != sentence_id
+        ):
+            self._pending_play_request = None
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+
+            if self._media_player.mediaStatus() not in {
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+            }:
+                return
+        except Exception:
+            return
+        self._started_play_generation = generation
+        self._media_player.setPosition(start_ms)
+        self._media_player.play()
+        self.stop_audio_button.setEnabled(True)
+
+    def _media_status_changed(self, status):
+        if self._media_player is None or self._pending_play_request is None:
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+
+            loaded_statuses = {
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+            }
+        except Exception:
+            return
+        request = self._pending_play_request
+        if status in loaded_statuses and request[0] == self._media_source_path:
+            self._begin_pending_play()
+
+    def _media_position_changed(self, position: int):
+        request = self._pending_play_request
+        if (
+            request is None
+            or request[4] != self._play_generation
+            or request[4] != self._started_play_generation
+            or self._media_player is None
+        ):
+            return
+        try:
+            if int(self._media_player.position()) != int(position):
+                return
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return
+        if position >= request[3]:
+            self._stop_playback()
+
+    def _media_error(self, _error, _message=""):
+        if self._media_player is None:
+            return
+        self._pending_play_request = None
+        self._started_play_generation = None
+        self._play_generation += 1
+        self._media_source_path = None
+        self._media_source_fingerprint = None
+        self.sentence_precision_note.setText("当前系统无法播放此音频格式；转写和校对仍可继续。")
+
+    def _stop_playback(self, *, clear_source: bool = False):
+        self._play_generation += 1
+        self._pending_play_request = None
+        self._started_play_generation = None
+        if self._media_player is not None:
+            self._media_player.stop()
+            if clear_source:
+                self._media_player.setSource(QUrl())
+        if clear_source:
+            self._media_source_path = None
+            self._media_source_fingerprint = None
 
     def _show_selected_analysis(self):
         row = self.table.currentRow()
+        previous_editor_row = self._editor_row
+        if previous_editor_row is not None and previous_editor_row != row:
+            if self.save_correction_button.isEnabled():
+                self._save_sentence_correction(
+                    silent=True,
+                    row=previous_editor_row,
+                    sentence_id=self._selected_sentence_id,
+                    refresh=False,
+                )
+            self._stop_playback(clear_source=True)
         self.preview.clear()
         self.speaker1_example.setText("说话人1示例：—")
         self.speaker2_example.setText("说话人2示例：—")
@@ -792,6 +1794,19 @@ class MainWindow(QMainWindow):
             self._updating_role = True
             self.role_combo.setCurrentIndex(0)
             self._updating_role = False
+            self._suppress_sentence_events = True
+            self.sentence_combo.clear()
+            self.sentence_combo.setEnabled(False)
+            self.sentence_editor.clear()
+            self.sentence_editor.setEnabled(False)
+            self.sentence_speaker_combo.setCurrentIndex(0)
+            self.sentence_speaker_combo.setEnabled(False)
+            self.save_correction_button.setEnabled(False)
+            self.play_sentence_button.setEnabled(False)
+            self.stop_audio_button.setEnabled(self._media_player is not None)
+            self._suppress_sentence_events = False
+            self._editor_row = None
+            self._selected_sentence_id = None
             _set_status_badge(self.preview_state, "等待选择", "muted")
             self.preview.setPlainText("从左侧队列选择一条录音；处理完成后，这里会显示逐字稿和角色确认。")
             return
@@ -808,10 +1823,25 @@ class MainWindow(QMainWindow):
             detail_text = detail_item.text() if detail_item is not None else ""
             tone = "processing" if status_text == "处理中" else "pending"
             _set_status_badge(self.preview_state, status_text, tone)
+            self._suppress_sentence_events = True
+            self.sentence_combo.clear()
+            self.sentence_combo.setEnabled(False)
+            self.sentence_editor.clear()
+            self.sentence_editor.setEnabled(False)
+            self.sentence_speaker_combo.setCurrentIndex(0)
+            self.sentence_speaker_combo.setEnabled(False)
+            self.save_correction_button.setEnabled(False)
+            self.play_sentence_button.setEnabled(False)
+            self.stop_audio_button.setEnabled(self._media_player is not None)
+            self._suppress_sentence_events = False
+            self._editor_row = None
+            self._selected_sentence_id = None
             self.preview.setPlainText(detail_text or "该文件尚未处理。")
             return
 
         status_text, tone = _analysis_status(result)
+        if result.source_changed:
+            status_text, tone = "音频已变化，旧结果已保留", "warning"
         _set_status_badge(self.preview_state, status_text, tone)
 
         choice = self.role_choices.get(str(result.input_path))
@@ -844,7 +1874,13 @@ class MainWindow(QMainWindow):
             self.preview.setPlainText("未检测到语音。仍可保存一份标明无语音的 Word 和 JSON 结果。")
         elif result.words:
             lines = []
-            for item in build_sentences(result.words, result.emotion_windows, result.tone_enabled):
+            reviewed_sentences = revise_sentences(
+                result.words,
+                result.sentence_revisions,
+                result.emotion_windows,
+                result.tone_enabled,
+            )
+            for item in reviewed_sentences:
                 start = max(0, int(float(item["start"])))
                 timestamp = f"[{start // 60:02d}:{start % 60:02d}]"
                 speaker = _speaker_label(item.get("speaker_id"))
@@ -871,22 +1907,38 @@ class MainWindow(QMainWindow):
                         state = "部分失败" if result.tone_status == "partial" else "失败"
                         lines.append(f"情绪倾向分析：{state}。{result.tone_error}")
                     lines.append("句后置信度显示未校准的模型原始分数，不代表准确率或概率。")
+            if result.sentence_revisions:
+                lines.extend(["", "声学统计依据原音频分段；人工校对不重算统计。"])
             self.preview.setPlainText("\n".join(lines))
         else:
             self.preview.setPlainText("没有可预览的转写内容。")
 
+        self._populate_sentence_review(row, result)
         self.role_combo.setEnabled(
-            result.status in {"ready", "exported", "export_failed"} and bool(result.words)
+            result.status in {"ready", "exported", "export_failed"} and bool(result.words) and not result.source_changed
         )
-        self.save_button.setEnabled(result.status in {"ready", "no_speech", "exported", "export_failed"})
+        self.save_button.setEnabled(
+            result.status in {"ready", "no_speech", "exported", "export_failed"} and not result.source_changed
+        )
         self.open_word_button.setEnabled(bool(result.word_path and result.word_path.is_file()))
         self.open_json_button.setEnabled(bool(result.json_path and result.json_path.is_file()))
 
     def _save_results(self):
+        if self.save_correction_button.isEnabled():
+            self._save_sentence_correction(silent=True, refresh=False)
+        output_text = self.output_edit.text().strip()
+        if not output_text:
+            QMessageBox.information(self, "缺少保存目录", "请选择转写结果的保存目录。")
+            return
+        output_root = Path(output_text).expanduser().resolve()
+        if self.input_root and output_root == self.input_root:
+            QMessageBox.warning(self, "保存目录冲突", "音频文件夹和保存目录不能相同。")
+            return
         eligible = [
             (index, item)
             for index, item in enumerate(self.analyses)
-            if item is not None and self._needs_export(item)
+            if item is not None
+            and self._needs_export(item, self._output_directory_for_row(index, output_root))
         ]
         if not eligible:
             QMessageBox.information(self, "没有待保存的结果", "结果已保存，所选角色也没有变更。")
@@ -896,17 +1948,32 @@ class MainWindow(QMainWindow):
         errors = []
         for index, result in eligible:
             speaker = self.role_choices.get(str(result.input_path))
+            desired_dir = self._output_directory_for_row(index, output_root)
+            previous_dir = result.output_dir
+            previous_word = result.word_path
+            previous_json = result.json_path
+            changed_target = desired_dir.resolve(strict=False) != previous_dir.resolve(strict=False)
+            if changed_target:
+                result.output_dir = desired_dir
+                result.word_path = None
+                result.json_path = None
             try:
                 word_path, json_path = pipeline.export_file(result, counselor_speaker=speaker)
                 self._set_queue_status(index, "exported", "已导出")
                 self._set_queue_detail(index, f"Word + JSON 已保存：{word_path.name}")
                 saved += 1
             except Exception as exc:
+                error = self._redact_result_error(result, str(exc)[:500])
+                if changed_target:
+                    result.output_dir = previous_dir
+                    result.word_path = previous_word
+                    result.json_path = previous_json
                 result.status = "export_failed"
-                result.error = str(exc)[:500]
-                errors.append(f"{result.input_path.name}：{result.error[:300]}")
+                result.error = error
+                errors.append(f"{result.input_path.name}：{error[:300]}")
                 self._set_queue_status(index, "export_failed", "导出失败")
-                self._set_queue_detail(index, result.error)
+                self._set_queue_detail(index, error)
+            self._persist_session()
         self._update_counts()
         self._show_selected_analysis()
         message = f"已保存 {saved} 个 Word + JSON 结果。"
@@ -916,14 +1983,48 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "保存完成", message)
 
-    def _needs_export(self, result: FileAnalysis) -> bool:
+    def _output_directory_for_row(self, row: int, output_root: Path) -> Path:
+        source = self.input_files[row].resolve(strict=False)
+        if self.input_root:
+            try:
+                relative = source.relative_to(self.input_root.resolve(strict=False))
+                return output_root / relative.parent
+            except ValueError:
+                pass
+        return output_root
+
+    @staticmethod
+    def _redact_result_error(result: FileAnalysis, message: str) -> str:
+        sanitized = str(message).strip() or "导出失败。"
+        for private_path in (result.input_path, result.output_dir):
+            if private_path:
+                sanitized = sanitized.replace(str(private_path), "[本地路径]")
+        return sanitized[:500]
+
+    def _needs_export(self, result: FileAnalysis, desired_output_dir: Path | None = None) -> bool:
+        if result.source_changed:
+            return False
         if result.status in {"ready", "no_speech", "export_failed"}:
             return True
         if result.status == "exported":
             requested = self.role_choices.get(str(result.input_path))
             if not result.words:
                 requested = None
-            return requested != result.counselor_speaker
+            files_missing = not (
+                result.word_path
+                and result.json_path
+                and result.word_path.is_file()
+                and result.json_path.is_file()
+            )
+            return (
+                requested != result.counselor_speaker
+                or result.revision != result.exported_revision
+                or files_missing
+                or (
+                    desired_output_dir is not None
+                    and desired_output_dir.resolve(strict=False) != result.output_dir.resolve(strict=False)
+                )
+            )
         return False
 
     def _open_selected(self, kind):
@@ -938,6 +2039,7 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def closeEvent(self, event):
+        self._stop_playback(clear_source=True)
         if self.worker and self.worker.isRunning():
             self._close_when_done = True
             self.worker.cancel()
@@ -945,6 +2047,10 @@ class MainWindow(QMainWindow):
             self.progress_label.setText("正在安全停止当前处理；窗口会在处理线程结束后关闭。")
             event.ignore()
             return
+        if self.save_correction_button.isEnabled():
+            self._save_sentence_correction(silent=True, refresh=False)
+        self._stop_playback(clear_source=True)
+        self._persist_session()
         event.accept()
 
 

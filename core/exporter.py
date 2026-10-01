@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from docx import Document
 
-from core.transcript import build_sentences, format_sentence
+from core.transcript import build_sentences, format_sentence, revise_sentences
 
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -33,6 +33,62 @@ def _available_stem(directory: Path, requested: str) -> str:
         candidate = f"{base} ({suffix})"
         suffix += 1
     return candidate
+
+
+def _temporary_path(directory: Path, suffix: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        prefix=".consult-asr-", suffix=suffix, dir=directory, delete=False
+    ) as file:
+        return Path(file.name)
+
+
+def _install_pair(
+    temporary_paths: tuple[Path, Path],
+    target_paths: tuple[Path, Path],
+    *,
+    overwrite: bool,
+) -> None:
+    """Install a prepared pair, restoring any prior pair if either replace fails."""
+    backups: dict[Path, Path] = {}
+    installed: list[Path] = []
+    unrecoverable_backups: set[Path] = set()
+    try:
+        if overwrite:
+            for target in target_paths:
+                if target.exists() or target.is_symlink():
+                    if not target.is_file():
+                        raise IsADirectoryError(str(target))
+                    backup = _temporary_path(target.parent, ".backup")
+                    backup.unlink()
+                    os.replace(target, backup)
+                    backups[target] = backup
+        elif any(target.exists() or target.is_symlink() for target in target_paths):
+            raise FileExistsError("An export target already exists")
+
+        for temporary, target in zip(temporary_paths, target_paths):
+            os.replace(temporary, target)
+            installed.append(target)
+    except Exception:
+        for target in installed:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for target, backup in backups.items():
+            try:
+                os.replace(backup, target)
+            except OSError:
+                # Keep the only remaining copy available for manual recovery.
+                unrecoverable_backups.add(backup)
+        raise
+    finally:
+        for backup in backups.values():
+            if backup in unrecoverable_backups:
+                continue
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _stamp(seconds: float) -> str:
@@ -120,16 +176,51 @@ def write_exports(
     tone_status: str | None = None,
     tone_error: str = "",
     tone_model: Mapping[str, Any] | None = None,
+    sentence_revisions: Mapping[str, Mapping[str, Any]] | None = None,
+    revision: int = 0,
+    overwrite_paths: tuple[str | os.PathLike[str], str | os.PathLike[str]] | None = None,
+    source_fingerprint: Mapping[str, int] | None = None,
 ) -> tuple[Path, Path]:
-    """Write a Word transcript and a timestamped JSON sidecar without clobbering files."""
+    """Write a Word transcript and JSON sidecar, optionally replacing a saved pair."""
     directory = Path(output_dir).expanduser().resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    stem = _available_stem(directory, filename)
-    word_path = directory / f"{stem}.docx"
-    json_path = directory / f"{stem}.json"
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("revision must be a non-negative integer")
+    fingerprint_payload: dict[str, int] | None = None
+    if source_fingerprint is not None:
+        if not isinstance(source_fingerprint, Mapping):
+            raise TypeError("source_fingerprint must be a mapping")
+        fingerprint_payload = {}
+        for key in ("size_bytes", "mtime_ns"):
+            value = source_fingerprint.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("source_fingerprint values must be non-negative integers")
+            fingerprint_payload[key] = value
+    overwrite = overwrite_paths is not None
+    if overwrite_paths is None:
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = _available_stem(directory, filename)
+        word_path = directory / f"{stem}.docx"
+        json_path = directory / f"{stem}.json"
+    else:
+        if len(overwrite_paths) != 2:
+            raise ValueError("overwrite_paths must contain the Word and JSON target paths")
+        word_path, json_path = (
+            Path(path).expanduser().resolve(strict=False) for path in overwrite_paths
+        )
+        if word_path == json_path:
+            raise ValueError("Word and JSON export paths must be different")
+        if (
+            word_path.parent != directory
+            or json_path.parent != directory
+            or word_path.suffix.lower() != ".docx"
+            or json_path.suffix.lower() != ".json"
+            or word_path.stem != json_path.stem
+        ):
+            raise ValueError("overwrite_paths must be a matching pair inside output_dir")
+        word_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
     temp_word: Path | None = None
     temp_json: Path | None = None
-    installed: list[Path] = []
 
     speaker_names = {"speaker_1": "说话人1", "speaker_2": "说话人2"}
     if role_labels:
@@ -145,7 +236,12 @@ def write_exports(
         }
         for turn in sorted(segments, key=lambda item: (float(item["start"]), float(item["end"])))
     ]
-    sentences = build_sentences(words, emotion_windows, tone_enabled)
+    use_revisions = sentence_revisions is not None or revision != 0
+    sentences = (
+        revise_sentences(words, sentence_revisions, emotion_windows, tone_enabled)
+        if use_revisions
+        else build_sentences(words, emotion_windows, tone_enabled)
+    )
     doc = Document()
     doc.add_heading("咨询记录", level=1)
     doc.add_paragraph(f"音频：{Path(source_name).name}")
@@ -163,7 +259,7 @@ def write_exports(
     has_extended_analysis = any(
         value is not None
         for value in (segments, emotion_windows, analysis_windows, tone_enabled, tone_status, tone_model)
-    )
+    ) or use_revisions
     if has_extended_analysis:
         doc.add_heading("语音特征与情绪倾向", level=2)
         doc.add_paragraph(
@@ -230,12 +326,16 @@ def write_exports(
         "words": json_words,
         "segments": json_turns,
     }
+    if fingerprint_payload is not None:
+        payload["source_fingerprint"] = fingerprint_payload
     if has_extended_analysis:
         payload["sentences"] = [
             {**sentence, "speaker": speaker_names.get(sentence.get("speaker_id"), "说话人（待确认）"),
              "annotated_text": format_sentence(sentence)}
             for sentence in sentences
         ]
+        if use_revisions:
+            payload["revision"] = revision
         payload["tone_analysis"] = {
             "enabled": tone_enabled,
             "status": tone_status,
@@ -260,29 +360,15 @@ def write_exports(
         ]
 
     try:
-        with tempfile.NamedTemporaryFile(prefix=".consult-asr-", suffix=".docx", dir=directory, delete=False) as file:
-            temp_word = Path(file.name)
+        temp_word = _temporary_path(word_path.parent, ".docx")
         doc.save(temp_word)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", prefix=".consult-asr-", suffix=".json", dir=directory, delete=False
-        ) as file:
-            temp_json = Path(file.name)
+        temp_json = _temporary_path(json_path.parent, ".json")
+        with temp_json.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
             file.write("\n")
 
-        # Outputs are newly chosen names; roll back the first if the second move fails.
-        os.replace(temp_word, word_path)
-        installed.append(word_path)
-        os.replace(temp_json, json_path)
-        installed.append(json_path)
+        _install_pair((temp_word, temp_json), (word_path, json_path), overwrite=overwrite)
         return word_path, json_path
-    except Exception:
-        for path in installed:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
     finally:
         for path in (temp_word, temp_json):
             if path is not None:
