@@ -11,6 +11,7 @@ from typing import Callable
 STAGE_LABELS = {
     "normalize": "音频准备", "asr": "语音识别", "diarization": "说话人区分",
     "acoustics": "声学分析", "emotion": "情绪分析", "cleanup": "资源释放",
+    "asr_model_load": "识别模型加载", "diarization_model_load": "说话人模型加载",
 }
 
 

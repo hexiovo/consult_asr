@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.help_dialog import UserGuideDialog
-from app.pipeline import ConsultationPipeline, FileAnalysis
+from app.pipeline import ConsultationPipeline, FileAnalysis, _processing_profile
 from config import (
     ASR_MODEL_DIR,
     DIARIZATION_MODEL_DIR,
@@ -174,6 +174,9 @@ class ProcessingWorker(QThread):
         beam_size,
         tone_enabled=None,
         row_indices=None,
+        inference_mode="accurate",
+        batch_size=2,
+        cpu_threads=8,
     ):
         super().__init__()
         self.files = list(files)
@@ -186,6 +189,9 @@ class ProcessingWorker(QThread):
         self.compute_type = compute_type
         self.beam_size = beam_size
         self.tone_enabled = tone_enabled
+        self.inference_mode = inference_mode
+        self.batch_size = min(4, max(2, int(batch_size)))
+        self.cpu_threads = min(8, max(1, int(cpu_threads)))
         self.cancel_event = Event()
 
     def cancel(self):
@@ -207,17 +213,36 @@ class ProcessingWorker(QThread):
             compute_type = self.compute_type
             if device == "cpu":
                 compute_type = "int8" if compute_type == "int8_float16" else "float32"
+            expected_mode = (
+                "gpu_batch_vad"
+                if self.inference_mode == "gpu_batch" and device == "cuda"
+                else ("accurate_cuda_fallback" if self.inference_mode == "gpu_batch" else "accurate")
+            )
+            expected_batch = self.batch_size if expected_mode == "gpu_batch_vad" else 0
             durations = []
             for path in self.files:
                 durations.append(None if self.cancel_event.is_set() else probe_audio_duration(path))
-            profile = f"v1-{device}-{compute_type}-beam{self.beam_size}-emotion{int(bool(self.tone_enabled))}"
+            profile = _processing_profile(
+                device,
+                compute_type,
+                self.beam_size,
+                self.tone_enabled,
+                expected_mode,
+                expected_batch,
+                self.cpu_threads,
+            )
             self.timing_configured.emit(durations, profile)
             pipeline = ConsultationPipeline(
                 device=device,
                 compute_type=compute_type,
                 beam_size=self.beam_size,
                 tone_enabled=self.tone_enabled,
+                inference_mode=self.inference_mode,
+                batch_size=self.batch_size,
+                cpu_threads=self.cpu_threads,
             )
+            if self.inference_mode == "gpu_batch" and device != "cuda":
+                self.progress.emit(0, len(self.files), -1, "GPU不可用，当前使用准确模式继续处理。")
             total = len(self.files)
             for work_index, path in enumerate(self.files):
                 row = self.row_indices[work_index]
@@ -255,7 +280,6 @@ class ProcessingWorker(QThread):
                     stage_progress=lambda stage, fraction, seconds, queue_row=row:
                         self.stage_progress.emit(queue_row, stage, fraction, seconds),
                 )
-                analysis.profile = profile
                 final_fingerprint = _current_fingerprint(source)
                 if initial_fingerprint is not None:
                     analysis.source_size_bytes = initial_fingerprint["size_bytes"]
@@ -633,6 +657,36 @@ class MainWindow(QMainWindow):
         self.beam_spin.setRange(1, 10)
         self.beam_spin.setValue(5)
         advanced_layout.addWidget(self.beam_spin, 0, 5)
+        advanced_layout.addWidget(QLabel("推理模式"), 1, 0)
+        self.inference_mode_combo = _SageRoleComboBox()
+        self.inference_mode_combo.setObjectName("sageCombo")
+        self.inference_mode_combo.addItem("准确优先（默认）", "accurate")
+        self.inference_mode_combo.addItem("GPU批量加速（VAD分段）", "gpu_batch")
+        self.inference_mode_combo.setToolTip(
+            "GPU批量模式会使用VAD检测语音并改变分段边界及解码回退行为；保留beam=5和词级时间戳。"
+            "显存不足时会从头降低batch，必要时退回原串行识别。准确优先模式保持现有VAD关闭路径。"
+        )
+        self.inference_mode_combo.currentIndexChanged.connect(self._refresh_performance_controls)
+        advanced_layout.addWidget(self.inference_mode_combo, 1, 1, 1, 3)
+        advanced_layout.addWidget(QLabel("批量大小"), 1, 4)
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(2, 4)
+        self.batch_size_spin.setValue(2)
+        advanced_layout.addWidget(self.batch_size_spin, 1, 5)
+        advanced_layout.addWidget(QLabel("ASR CPU线程"), 2, 0)
+        self.cpu_threads_spin = QSpinBox()
+        self.cpu_threads_spin.setRange(1, 8)
+        self.cpu_threads_spin.setValue(8)
+        self.cpu_threads_spin.setToolTip("限制 faster-whisper/CTranslate2 使用的CPU线程数，范围为1到8。")
+        advanced_layout.addWidget(self.cpu_threads_spin, 2, 1)
+        self.performance_hint = QLabel(
+            "准确模式维持现有VAD关闭路径；ASR线程数限制在1到8。"
+        )
+        self.performance_hint.setObjectName("mutedLabel")
+        self.performance_hint.setWordWrap(True)
+        advanced_layout.addWidget(self.performance_hint, 2, 2, 1, 4)
+        self.device_combo.currentIndexChanged.connect(self._refresh_performance_controls)
+        self._refresh_performance_controls()
         self.advanced_panel.setVisible(False)
         outer.addWidget(self.advanced_panel)
 
@@ -768,6 +822,22 @@ class MainWindow(QMainWindow):
         self.advanced_panel.setVisible(checked)
         self.advanced_toggle.setText("收起高级识别设置" if checked else "显示高级识别设置")
 
+    def _refresh_performance_controls(self, *_):
+        batch_selected = self.inference_mode_combo.currentData() == "gpu_batch"
+        self.batch_size_spin.setEnabled(batch_selected)
+        if batch_selected and self.device_combo.currentData() == "cpu":
+            self.performance_hint.setText(
+                "当前设备选为CPU，GPU批量模式会回退到准确识别；改为自动后会在CUDA可用时启用。"
+            )
+        elif batch_selected:
+            self.performance_hint.setText(
+                "VAD会过滤静音并改变分段/解码回退行为；结果请复核。显存不足时自动降batch或退回准确串行。"
+            )
+        else:
+            self.performance_hint.setText(
+                "准确模式维持现有VAD关闭路径；ASR线程数限制在1到8。"
+            )
+
     def _choose_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -872,6 +942,7 @@ class MainWindow(QMainWindow):
             "tone_model": result.tone_model,
             "tone_status": result.tone_status,
             "tone_error": str(result.tone_error or "")[:500],
+            "performance": result.performance,
             "sentence_revisions": result.sentence_revisions,
             "revision": result.revision,
             "exported_revision": result.exported_revision,
@@ -1029,6 +1100,10 @@ class MainWindow(QMainWindow):
             raise ValueError("缓存情绪状态无效")
         result.tone_status = tone_status
         result.tone_error = str(record.get("tone_error", ""))[:500]
+        performance = record.get("performance", {})
+        if not isinstance(performance, dict) or len(performance) > 32:
+            raise ValueError("缓存性能记录无效")
+        result.performance = performance
         result.sentence_revisions = revisions
         result.revision = revision
         result.exported_revision = exported_revision
@@ -1324,6 +1399,12 @@ class MainWindow(QMainWindow):
         device_choice = self.device_combo.currentData() if self.advanced_toggle.isChecked() else "auto"
         compute_type = self.compute_combo.currentData() if self.advanced_toggle.isChecked() else "float16"
         beam_size = self.beam_spin.value() if self.advanced_toggle.isChecked() else 5
+        inference_mode = (
+            self.inference_mode_combo.currentData()
+            if self.advanced_toggle.isChecked() else "accurate"
+        )
+        batch_size = self.batch_size_spin.value() if self.advanced_toggle.isChecked() else 2
+        cpu_threads = self.cpu_threads_spin.value() if self.advanced_toggle.isChecked() else 8
         self.worker = ProcessingWorker(
             [self.input_files[row] for row in pending_rows],
             self.input_root,
@@ -1333,6 +1414,9 @@ class MainWindow(QMainWindow):
             beam_size,
             self.tone_enabled_check.isChecked(),
             row_indices=pending_rows,
+            inference_mode=inference_mode,
+            batch_size=batch_size,
+            cpu_threads=cpu_threads,
         )
         self.worker.progress.connect(self._progress)
         self.worker.analysis_ready.connect(self._analysis_ready)
@@ -1380,11 +1464,20 @@ class MainWindow(QMainWindow):
             return
         self.analyses[row] = result
         learn_timing = result.status == "ready" and bool(result.words) and result.tone_status not in {"failed", "partial"}
+        if result.profile and result.profile != self._timing_profile:
+            self._timing_profile = result.profile
+            try:
+                rates = json.loads(self._timing_settings.value(f"rates/{result.profile}", "[]"))
+                if not isinstance(rates, list):
+                    rates = []
+            except (ValueError, TypeError):
+                rates = []
+            self._time_estimator.configure(list(self._time_estimator.durations), rates)
         eta_row = self._eta_index_by_row.get(row)
         if eta_row is not None:
             self._time_estimator.complete(eta_row, result.duration_seconds, result.elapsed_seconds, learn_timing)
-        if learn_timing and self._timing_profile:
-            self._timing_settings.setValue(f"rates/{self._timing_profile}", json.dumps(self._time_estimator.rates))
+        if learn_timing and result.profile:
+            self._timing_settings.setValue(f"rates/{result.profile}", json.dumps(self._time_estimator.rates))
             self._timing_settings.sync()
         self._update_time_estimate()
         status_text, tone = _analysis_status(result)

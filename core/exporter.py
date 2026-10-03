@@ -180,6 +180,7 @@ def write_exports(
     revision: int = 0,
     overwrite_paths: tuple[str | os.PathLike[str], str | os.PathLike[str]] | None = None,
     source_fingerprint: Mapping[str, int] | None = None,
+    performance: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     """Write a Word transcript and JSON sidecar, optionally replacing a saved pair."""
     directory = Path(output_dir).expanduser().resolve()
@@ -326,6 +327,10 @@ def write_exports(
         "words": json_words,
         "segments": json_turns,
     }
+    if performance is not None:
+        if not isinstance(performance, Mapping):
+            raise TypeError("performance must be a mapping")
+        payload["processing"] = dict(performance)
     if fingerprint_payload is not None:
         payload["source_fingerprint"] = fingerprint_payload
     if has_extended_analysis:

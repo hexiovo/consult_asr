@@ -1,7 +1,15 @@
 # Version
 
-Current version: **2.3.2**
-Updated: 2026-10-02
+Current version: **2.4.0**
+Updated: 2026-10-03
+
+## 2.4.0
+
+- Add opt-in GPU batched ASR with VAD, batch-size fallback, and a bounded ASR CPU-thread setting; accurate serial inference remains the default. Separate ETA histories by inference mode, batch size, and CPU threads.
+- Close failed lazy batch iterators, reset their speech-timestamp state, and begin OOM retries only after the failed exception frame is released. Release the ASR model on failure or cancellation before GPU cache cleanup.
+- Compare one 76.76-second synthetic Chinese audio on an RTX 4060 Laptop GPU (8 GB), float16, beam 5, and 8 CPU threads: ASR inference took 5.94 seconds in accurate mode and 4.41 seconds with GPU batch 2 (25.6% less inference time, about 1.35x). Both runs returned 212 word entries and timestamp bounds of 0–75.64 seconds; text matched after removing punctuation and whitespace, while sentence punctuation/boundaries differed.
+- Record the CUDA driver's approximately 3.2 GiB free-memory sample after model loading as a point-in-time reading, not peak usage. The benchmark retained only timestamp count and minimum/maximum bounds, not per-word arrays for cross-mode comparison.
+- Validate OOM iterator close/state reset, traceback release before retry, failure/cancel model cleanup and temporary-directory removal with targeted mocks; AST parsing and `git diff --check` pass. The illustrated PDF remains the v2.3.2 historical edition; `USER_GUIDE.md` contains the current settings.
 
 ## 2.3.2
 

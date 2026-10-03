@@ -46,6 +46,7 @@ class FileAnalysis:
     tone_model: dict[str, Any] | None = None
     tone_status: str | None = None
     tone_error: str = ""
+    performance: dict[str, Any] = field(default_factory=dict)
     sentence_revisions: dict[str, dict[str, Any]] = field(default_factory=dict)
     revision: int = 0
     exported_revision: int = -1
@@ -83,8 +84,14 @@ def _processing_profile(
     compute_type: str | None,
     beam_size: int,
     tone_enabled: bool | None,
+    inference_mode: str = "accurate",
+    batch_size: int = 0,
+    cpu_threads: int = 8,
 ) -> str:
-    return f"v1-{device}-{compute_type}-beam{beam_size}-emotion{int(bool(tone_enabled))}"
+    return (
+        f"v2-{device}-{compute_type}-beam{beam_size}-emotion{int(bool(tone_enabled))}"
+        f"-mode{inference_mode}-batch{batch_size}-cpu{cpu_threads}"
+    )
 
 
 def _source_fingerprint(path: Path) -> tuple[int, int] | None:
@@ -164,6 +171,9 @@ class ConsultationPipeline:
         tone_enabled: bool | None = None,
         tone_model_dir: str | os.PathLike[str] = TONE_MODEL_DIR,
         tone_runtime_dir: str | os.PathLike[str] = TONE_RUNTIME_DIR,
+        inference_mode: str = "accurate",
+        batch_size: int = 2,
+        cpu_threads: int = 8,
     ) -> None:
         self.device = device
         self.compute_type = compute_type
@@ -172,6 +182,9 @@ class ConsultationPipeline:
         self.tone_enabled = None if tone_enabled is None else bool(tone_enabled)
         self.tone_model_dir = Path(tone_model_dir).expanduser().resolve()
         self.tone_runtime_dir = Path(tone_runtime_dir).expanduser().resolve()
+        self.inference_mode = inference_mode
+        self.batch_size = min(4, max(2, int(batch_size)))
+        self.cpu_threads = min(8, max(1, int(cpu_threads)))
 
     def analyze_file(
         self,
@@ -190,9 +203,13 @@ class ConsultationPipeline:
             self.compute_type,
             self.beam_size,
             self.tone_enabled,
+            self.inference_mode,
+            self.batch_size if self.inference_mode == "gpu_batch" else 0,
+            self.cpu_threads,
         )
         started = time.perf_counter()
         task_dir: Path | None = None
+        transcriber: Transcriber | None = None
         diarizer: Diarizer | None = None
         emotion_recognizer: Any | None = None
         result.tone_enabled = self.tone_enabled
@@ -241,19 +258,70 @@ class ConsultationPipeline:
 
             if progress:
                 progress("正在识别中文语音…")
-            timing("asr")
+            timing("asr_model_load")
             transcriber = Transcriber(
                 device=self.device,
                 compute_type=self.compute_type,
                 beam_size=self.beam_size,
+                inference_mode=self.inference_mode,
+                batch_size=self.batch_size,
+                cpu_threads=self.cpu_threads,
             )
+            load_started = time.perf_counter()
+            try:
+                transcriber.load()
+            finally:
+                result.performance = {
+                    "device": self.device,
+                    "compute_type": self.compute_type,
+                    "beam_size": self.beam_size,
+                    "requested_inference_mode": transcriber.requested_inference_mode,
+                    "effective_inference_mode": transcriber.effective_inference_mode,
+                    "requested_batch_size": transcriber.requested_batch_size
+                    if transcriber.requested_inference_mode == "gpu_batch" else 0,
+                    "effective_batch_size": transcriber.effective_batch_size,
+                    "cpu_threads": transcriber.cpu_threads,
+                    "fallback_path": transcriber.fallback_path_taken,
+                    "asr_model_load_seconds": max(
+                        transcriber.model_load_seconds,
+                        time.perf_counter() - load_started,
+                    ),
+                }
+                result.profile = _processing_profile(
+                    self.device,
+                    self.compute_type,
+                    self.beam_size,
+                    self.tone_enabled,
+                    transcriber.effective_inference_mode,
+                    transcriber.effective_batch_size,
+                    transcriber.cpu_threads,
+                )
+            timing("asr_model_load", 1.0)
+            timing("asr")
             transcription_options: dict[str, Any] = {"cancel_event": cancel_event}
             if stage_progress and result.duration_seconds:
                 transcription_options["progress_seconds"] = lambda seconds: timing(
                     "asr", min(1.0, seconds / result.duration_seconds))
-            result.words = transcriber.transcribe(normalized, **transcription_options)
+            try:
+                result.words = transcriber.transcribe(normalized, **transcription_options)
+            finally:
+                result.performance.update({
+                    "effective_inference_mode": transcriber.effective_inference_mode,
+                    "effective_batch_size": transcriber.effective_batch_size,
+                    "fallback_path": transcriber.fallback_path_taken,
+                    "asr_inference_seconds": transcriber.inference_seconds,
+                })
+                result.profile = _processing_profile(
+                    self.device,
+                    self.compute_type,
+                    self.beam_size,
+                    self.tone_enabled,
+                    transcriber.effective_inference_mode,
+                    transcriber.effective_batch_size,
+                    transcriber.cpu_threads,
+                )
             timing("asr", 1.0)
-            del transcriber
+            transcriber = None
             _release_memory()
 
             if cancel_event and cancel_event.is_set():
@@ -269,9 +337,20 @@ class ConsultationPipeline:
 
             if progress:
                 progress("正在区分说话人…")
-            timing("diarization")
+            timing("diarization_model_load")
+            diarization_load_started = time.perf_counter()
             diarizer = Diarizer(device=self.device)
+            diarizer.load()
+            result.performance["diarization_model_load_seconds"] = (
+                time.perf_counter() - diarization_load_started
+            )
+            timing("diarization_model_load", 1.0)
+            timing("diarization")
+            diarization_started = time.perf_counter()
             diarization = diarizer.diarize(normalized, cancel_event=cancel_event)
+            result.performance["diarization_inference_seconds"] = (
+                time.perf_counter() - diarization_started
+            )
             timing("diarization", 1.0)
             result.words = align_words(diarization, result.words)
             result.segments = _merge_turns(result.words)
@@ -416,6 +495,8 @@ class ConsultationPipeline:
                     emotion_recognizer.close()
                 except Exception:
                     pass
+            if transcriber is not None:
+                transcriber = None
             if diarizer is not None:
                 diarizer.release()
                 del diarizer
@@ -462,6 +543,9 @@ class ConsultationPipeline:
                     self.compute_type,
                     self.beam_size,
                     result.tone_enabled,
+                    str(result.performance.get("effective_inference_mode", "accurate")),
+                    int(result.performance.get("effective_batch_size", 0) or 0),
+                    int(result.performance.get("cpu_threads", self.cpu_threads)),
                 )
             overwrite_paths = _known_export_pair(result)
             word_path, json_path = write_exports(
@@ -484,6 +568,7 @@ class ConsultationPipeline:
                 revision=result.revision,
                 overwrite_paths=overwrite_paths,
                 source_fingerprint={"size_bytes": fingerprint[0], "mtime_ns": fingerprint[1]},
+                performance=result.performance,
             )
         except Exception as exc:
             result.status = "export_failed"
