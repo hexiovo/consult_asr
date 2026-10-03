@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.4.0**
+Current version: **2.4.1**
 Updated: 2026-10-03
+
+## 2.4.1
+
+- Rename the recording selectors to “选择录音” and “选择文件夹” and explain that selecting a new batch replaces the current one.
+- Ask before replacing a nonempty queue; cancel, Escape, or closing the dialog preserves the current queue, corrections, roles, session file, and pending editor text. Explicit replacement follows the existing batch-loading flow.
+- Update README and USER_GUIDE to describe the in-app protection. The illustrated PDF remains the documented v2.3.2 historical edition.
 
 ## 2.4.0
 

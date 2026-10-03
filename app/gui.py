@@ -427,11 +427,13 @@ class MainWindow(QMainWindow):
         readiness.addWidget(refresh_models)
         outer.addLayout(readiness)
 
-        self.choose_files_button = QPushButton("添加录音")
+        self.choose_files_button = QPushButton("选择录音")
         self.choose_files_button.setObjectName("secondaryButton")
+        self.choose_files_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word + JSON。")
         self.choose_files_button.clicked.connect(self._choose_files)
-        self.choose_folder_button = QPushButton("添加文件夹")
+        self.choose_folder_button = QPushButton("选择文件夹")
         self.choose_folder_button.setObjectName("secondaryButton")
+        self.choose_folder_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word + JSON。")
         self.choose_folder_button.clicked.connect(self._choose_folder)
         self.clear_button = QPushButton("清空队列")
         self.clear_button.setObjectName("quietButton")
@@ -859,11 +861,31 @@ class MainWindow(QMainWindow):
             return
         self._set_inputs(files, root)
 
+    def _confirm_batch_replacement(self) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("替换当前批次")
+        dialog.setText(
+            "新选择会替换当前批次的队列、校对和角色确认，并删除本地恢复记录。"
+            "尚未导出的结果可能丢失，请先保存 Word + JSON。"
+        )
+        dialog.setInformativeText("选择“替换当前批次”继续；取消、按 Esc 或关闭此窗口都会保留当前工作。")
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        replace_button = dialog.addButton("替换当前批次", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.setDefaultButton(cancel_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        return dialog.clickedButton() == replace_button
+
     def _set_inputs(self, files, root):
+        unique = sorted({Path(item).resolve() for item in files}, key=lambda item: str(item).casefold())
+        if not unique:
+            return
+        if self.input_files and not self._confirm_batch_replacement():
+            return
         self._stop_playback(clear_source=True)
         self._delete_session_file()
         self._reset_time_estimate()
-        unique = sorted({Path(item).resolve() for item in files}, key=lambda item: str(item).casefold())
         self.input_files = unique
         self.input_root = Path(root).resolve() if root else None
         self.analyses = [None] * len(unique)
