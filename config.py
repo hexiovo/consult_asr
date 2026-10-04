@@ -17,6 +17,7 @@ DIARIZATION_MODEL_DIR = MODEL_ROOT / "pyannote" / "speaker-diarization-3.1"
 OPENAI_WHISPER_MODEL_DIR = MODEL_ROOT / "openai-whisper"
 TONE_MODEL_DIR = PROJECT_ROOT / "models" / "emotion2vec_plus_base"
 TONE_RUNTIME_DIR = PROJECT_ROOT / ".runtime" / "tone"
+LOG_DIR = PROJECT_ROOT / "log"
 TONE_DEFAULT_ENABLED = os.environ.get("CONSULT_ASR_TONE_ENABLED", "1").strip().casefold() not in {
     "0",
     "false",

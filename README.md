@@ -59,6 +59,12 @@ Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使�
 - Windows 默认会话文件为 `%LOCALAPPDATA%\ConsultASR\ConsultASR\session.json`（Qt `AppLocalDataLocation`）。缓存保存队列路径、完成结果、校对、导出位置以及源文件大小和修改时间；不会复制或缓存音频内容。
 - 点击“清空队列”会删除会话文件。也可先退出程序，再手动删除上述 `session.json`；这样只会清除恢复记录。
 
+## 本地诊断日志
+
+- 程序把受控诊断事件保存在项目目录的 `log/consult-asr-events.log`，采用 UTF-8；当前文件最多 2 MiB，另保留 3 个轮换备份（约 8 MiB 上限）。点击主窗口的“打开日志文件夹”可在系统文件管理器中查看；日志未初始化、目录不可用或文件尚未生成时会显示状态提示。
+- 日志只包含匿名运行标识、单文件任务序号、处理阶段、耗时、有效推理模式、固定降级/错误类别和终态。它不记录录音名或路径、转录/咨询文本、角色、异常原文、stdout/stderr、warnings 或 traceback。
+- 多个程序实例通过本地文件锁协调写入和轮换。锁或文件写入失败时会跳过诊断记录，不中断转写或成对导出。
+
 ## 本地资源与离线运行
 
 - 默认模型目录：`local_models/faster-whisper-large-v3`、`local_models/pyannote/speaker-diarization-3.1`、`local_models/openai-whisper` 和 `models/emotion2vec_plus_base`；独立运行依赖写入 `.runtime/tone`。模型/运行时路径在 Git 中忽略。设置 `CONSULT_ASR_MODEL_DIR` 可切换 ASR 与 pyannote 模型根目录；情绪资源使用固定项目目录。

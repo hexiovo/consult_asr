@@ -38,6 +38,7 @@ from app.pipeline import ConsultationPipeline, FileAnalysis, _processing_profile
 from config import (
     ASR_MODEL_DIR,
     DIARIZATION_MODEL_DIR,
+    LOG_DIR,
     OUTPUT_DIR,
     TONE_DEFAULT_ENABLED,
     TONE_MODEL_DIR,
@@ -50,6 +51,15 @@ from tools.prepare_models import verify_models
 from utils.audio_utils import collect_audio_files, probe_audio_duration
 from utils.result_store import AtomicJsonStore, ResultStoreError
 from utils.time_estimator import TimeEstimator
+from utils.logger import (
+    begin_task,
+    exception_fields,
+    is_logging_enabled,
+    log_event,
+    LOG_FILE_NAME,
+    init_logging,
+    shutdown_logging,
+)
 
 
 _SESSION_SCHEMA_VERSION = 1
@@ -256,12 +266,22 @@ class ProcessingWorker(QThread):
                 else:
                     destination = self.output_root
 
+                task_seq = begin_task()
                 if self.cancel_event.is_set():
+                    log_event("processing_start", task_seq=task_seq)
+                    log_event("cancel", task_seq=task_seq, stage="queue")
+                    log_event(
+                        "terminal",
+                        task_seq=task_seq,
+                        outcome="cancelled",
+                        stage="queue",
+                    )
                     analysis = FileAnalysis(
                         source,
                         destination,
                         status="cancelled",
                         error="在开始前取消。",
+                        diagnostic_task_seq=task_seq,
                     )
                     self.analysis_ready.emit(row, analysis)
                     completed_indices.add(work_index)
@@ -273,6 +293,7 @@ class ProcessingWorker(QThread):
                 analysis = pipeline.analyze_file(
                     source,
                     destination,
+                    task_seq=task_seq,
                     cancel_event=self.cancel_event,
                     progress=lambda stage, i=current, t=total, r=row: self.progress.emit(
                         i, t, r, f"[{i}/{t}] {stage}"
@@ -290,10 +311,22 @@ class ProcessingWorker(QThread):
                 completed_indices.add(work_index)
         except Exception as exc:
             # Unexpected queue-level errors are reported as failed items, never as success.
+            queue_error_fields = exception_fields(exc)
+            queue_error = f"处理队列失败：{type(exc).__name__}: {str(exc)[:500]}"
+            del exc
             for work_index, path in enumerate(self.files):
                 if work_index in completed_indices:
                     continue
                 row = self.row_indices[work_index]
+                task_seq = begin_task()
+                log_event("processing_start", task_seq=task_seq)
+                log_event(
+                    "terminal",
+                    task_seq=task_seq,
+                    outcome="failed",
+                    stage="queue",
+                    **queue_error_fields,
+                )
                 try:
                     source = Path(path).resolve()
                 except (OSError, RuntimeError, ValueError):
@@ -302,7 +335,8 @@ class ProcessingWorker(QThread):
                     source,
                     self.output_root,
                     status="failed",
-                    error=f"处理队列失败：{type(exc).__name__}: {str(exc)[:500]}",
+                    error=queue_error,
+                    diagnostic_task_seq=task_seq,
                 )
                 self.analysis_ready.emit(row, analysis)
                 completed_indices.add(work_index)
@@ -403,6 +437,11 @@ class MainWindow(QMainWindow):
         self.guide_button.setToolTip("查看本地指南：部署、转录、校对、导出、恢复与故障排查。")
         self.guide_button.clicked.connect(self._show_user_guide)
         header.addWidget(self.guide_button)
+        self.open_log_dir_button = QPushButton("打开日志文件夹")
+        self.open_log_dir_button.setObjectName("quietButton")
+        self.open_log_dir_button.setToolTip("打开本地诊断日志目录；日志未生成或不可用时会提示。")
+        self.open_log_dir_button.clicked.connect(self._open_log_folder)
+        header.addWidget(self.open_log_dir_button)
         outer.addLayout(header)
 
         readiness = QHBoxLayout()
@@ -1314,6 +1353,7 @@ class MainWindow(QMainWindow):
             if result is None or result.status in {"failed", "cancelled"} or result.source_changed
         )
         self._session_ready_count = restored_count
+        log_event("session_restore", record_count=restored_count)
         self.progress_label.setText(f"已恢复 {restored_count} 个完成结果，剩余 {pending_count} 个文件。")
         self.start_button.setText("继续处理" if pending_count else "开始处理")
         self._update_counts()
@@ -2169,6 +2209,40 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _open_log_folder(self):
+        if not is_logging_enabled():
+            QMessageBox.information(self, "日志暂不可用", "本次运行的日志尚未初始化。")
+            return
+        log_dir = Path(LOG_DIR)
+        try:
+            if not log_dir.exists() or not log_dir.is_dir():
+                QMessageBox.information(self, "日志暂不可用", "本地日志文件夹尚未创建或不可用。")
+                return
+            status_note = ""
+            try:
+                log_path = log_dir / LOG_FILE_NAME
+                if not log_path.exists():
+                    status_note = "日志文件尚未生成。"
+                elif log_path.stat().st_size == 0:
+                    status_note = "日志文件目前为空。"
+            except OSError:
+                status_note = "日志文件状态暂时无法读取。"
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir.resolve())))
+        except Exception:
+            QMessageBox.warning(self, "无法打开日志文件夹", "系统未能打开本地日志文件夹。")
+            return
+        if not opened:
+            message = "系统未能打开本地日志文件夹。"
+            if status_note:
+                message += "\n" + status_note
+            QMessageBox.warning(self, "无法打开日志文件夹", message)
+        elif status_note:
+            QMessageBox.information(
+                self,
+                "日志文件夹",
+                f"{status_note}\n系统已接受打开目录请求。",
+            )
+
     def closeEvent(self, event):
         self._stop_playback(clear_source=True)
         if self.worker and self.worker.isRunning():
@@ -2186,11 +2260,21 @@ class MainWindow(QMainWindow):
 
 
 def run_app() -> int:
-    app = QApplication.instance() or QApplication([])
-    _configure_application_fonts(app)
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    try:
+        try:
+            init_logging()
+        except Exception:
+            pass
+        app = QApplication.instance() or QApplication([])
+        _configure_application_fonts(app)
+        window = MainWindow()
+        window.show()
+        return app.exec()
+    finally:
+        try:
+            shutdown_logging()
+        except Exception:
+            pass
 
 
 def _file_status(status: str) -> tuple[str, str]:

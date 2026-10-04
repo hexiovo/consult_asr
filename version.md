@@ -1,7 +1,15 @@
 # Version
 
-Current version: **2.4.1**
-Updated: 2026-10-03
+Current version: **2.4.2**
+Updated: 2026-10-04
+
+## 2.4.2
+
+- Add local diagnostic event logging with a fixed privacy whitelist, anonymous run/task identifiers, and bounded UTF-8 rotation.
+- Add a main-window shortcut that opens the local log folder and reports unavailable or empty log states safely.
+- Associate per-file processing, retries, stage completion, cancellation, and terminal outcomes with one anonymous task sequence.
+- Coordinate concurrent application instances during writes and rotation; logger failures safely drop diagnostics without interrupting transcription or paired export.
+- Document the log location, retention limit, and fields excluded from diagnostic records.
 
 ## 2.4.1
 

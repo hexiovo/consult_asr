@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from config import ASR_MODEL_DIR, OPENAI_WHISPER_MODEL_DIR, WHISPER_MODEL
 from utils.audio_utils import ProcessingCancelled
+from utils.logger import log_event
 
 
 def _enable_offline_mode() -> None:
@@ -151,6 +152,7 @@ class Transcriber:
         cancel_event: Event | None = None,
         progress: Callable[[str], None] | None = None,
         progress_seconds: Callable[[float], None] | None = None,
+        diagnostic_task_seq: int | None = None,
     ) -> list[dict[str, Any]]:
         audio = Path(audio_path).expanduser().resolve()
         if not audio.is_file():
@@ -163,6 +165,7 @@ class Transcriber:
 
         if self._backend == "faster-whisper":
             if self._batched_model is not None:
+                self.fallback_path_taken = None
                 for attempt_index, batch_size in enumerate((self.requested_batch_size, 1)):
                     oom = False
                     try:
@@ -185,20 +188,27 @@ class Transcriber:
                             if attempt_index == 0
                             else "gpu_batch_vad_batch1_fallback"
                         )
-                        if attempt_index == 0:
-                            self.fallback_path_taken = None
+                        if attempt_index > 0:
+                            self.fallback_path_taken = "batch_oom_batch1"
                         return words
 
                     # Leave the except block before collecting again so its traceback
                     # cannot keep the failed generator's CUDA locals alive.
-                    self.fallback_path_taken = (
+                    next_fallback_code = (
                         "batch_oom_batch1" if attempt_index == 0 else "batch_oom_serial"
+                    )
+                    log_event(
+                        "retry",
+                        task_seq=diagnostic_task_seq,
+                        fallback_code=next_fallback_code,
+                        attempt=attempt_index + 1,
                     )
                     self._clear_cuda_cache()
 
                 words = self._transcribe_serial(audio, cancel_event, progress_seconds)
                 self.effective_batch_size = 0
                 self.effective_inference_mode = "accurate_oom_serial_fallback"
+                self.fallback_path_taken = "batch_oom_serial"
                 return words
             if self.fallback_path_taken is None:
                 self.effective_inference_mode = "accurate"

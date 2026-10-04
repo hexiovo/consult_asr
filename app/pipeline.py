@@ -21,6 +21,7 @@ from core.diarizer import Diarizer
 from core.exporter import write_exports
 from core.transcriber import Transcriber
 from utils.audio_utils import ProcessingCancelled, normalize_audio
+from utils.logger import begin_task, exception_fields, log_event
 
 
 ProgressCallback = Callable[[str], None]
@@ -51,6 +52,7 @@ class FileAnalysis:
     revision: int = 0
     exported_revision: int = -1
     profile: str | None = None
+    diagnostic_task_seq: int | None = None
     source_size_bytes: int | None = None
     source_mtime_ns: int | None = None
     source_changed: bool = False
@@ -194,6 +196,7 @@ class ConsultationPipeline:
         cancel_event: Event | None = None,
         progress: ProgressCallback | None = None,
         stage_progress: Callable[[str, float, float], None] | None = None,
+        task_seq: int | None = None,
     ) -> FileAnalysis:
         source = Path(input_path).expanduser().resolve()
         destination = Path(output_dir).expanduser().resolve()
@@ -213,8 +216,28 @@ class ConsultationPipeline:
         diarizer: Diarizer | None = None
         emotion_recognizer: Any | None = None
         result.tone_enabled = self.tone_enabled
+        task_seq = task_seq if task_seq is not None else begin_task()
+        result.diagnostic_task_seq = task_seq
+        log_event("processing_start", task_seq=task_seq)
+        current_stage = "application"
+        stage_started: dict[str, float] = {}
+        failure_fields: dict[str, str] | None = None
+        tone_error_fields: dict[str, str] | None = None
 
         def timing(stage: str, fraction: float = 0.0) -> None:
+            nonlocal current_stage
+            current_stage = stage
+            if fraction <= 0.0:
+                stage_started[stage] = time.perf_counter()
+            elif fraction >= 1.0:
+                stage_start = stage_started.pop(stage, None)
+                if stage_start is not None:
+                    log_event(
+                        "stage_complete",
+                        task_seq=task_seq,
+                        stage=stage,
+                        elapsed_ms=max(0, int((time.perf_counter() - stage_start) * 1000)),
+                    )
             if stage_progress:
                 stage_progress(stage, fraction, result.duration_seconds or 0.0)
 
@@ -299,9 +322,13 @@ class ConsultationPipeline:
             timing("asr_model_load", 1.0)
             timing("asr")
             transcription_options: dict[str, Any] = {"cancel_event": cancel_event}
+            transcription_options["diagnostic_task_seq"] = task_seq
             if stage_progress and result.duration_seconds:
-                transcription_options["progress_seconds"] = lambda seconds: timing(
-                    "asr", min(1.0, seconds / result.duration_seconds))
+                transcription_options["progress_seconds"] = lambda seconds: stage_progress(
+                    "asr",
+                    min(1.0, seconds / result.duration_seconds),
+                    result.duration_seconds or 0.0,
+                )
             try:
                 result.words = transcriber.transcribe(normalized, **transcription_options)
             finally:
@@ -319,6 +346,27 @@ class ConsultationPipeline:
                     transcriber.effective_inference_mode,
                     transcriber.effective_batch_size,
                     transcriber.cpu_threads,
+                )
+            log_event(
+                "inference_config",
+                task_seq=task_seq,
+                device=self.device,
+                compute_type=self.compute_type,
+                beam_size=self.beam_size,
+                requested_mode=transcriber.requested_inference_mode,
+                effective_mode=transcriber.effective_inference_mode,
+                requested_batch_size=transcriber.requested_batch_size
+                if transcriber.requested_inference_mode == "gpu_batch" else 0,
+                effective_batch_size=transcriber.effective_batch_size,
+                cpu_threads=transcriber.cpu_threads,
+            )
+            if transcriber.fallback_path_taken:
+                log_event(
+                    "fallback",
+                    task_seq=task_seq,
+                    fallback_code=transcriber.fallback_path_taken,
+                    effective_mode=transcriber.effective_inference_mode,
+                    effective_batch_size=transcriber.effective_batch_size,
                 )
             timing("asr", 1.0)
             transcriber = None
@@ -445,6 +493,7 @@ class ConsultationPipeline:
                     except ProcessingCancelled:
                         raise
                     except emotion_runtime_error as exc:
+                        tone_error_fields = exception_fields(exc)
                         result.tone_error = _safe_error(exc)
                         succeeded = any(item.get("status") == "ok" for item in result.emotion_windows)
                         result.tone_status = "partial" if succeeded else "failed"
@@ -456,6 +505,7 @@ class ConsultationPipeline:
                                     "reason": "emotion_runtime_failed",
                                 })
                     except Exception as exc:
+                        tone_error_fields = exception_fields(exc)
                         result.tone_error = _safe_error(exc)
                         succeeded = any(item.get("status") == "ok" for item in result.emotion_windows)
                         result.tone_status = "partial" if succeeded else "failed"
@@ -482,13 +532,26 @@ class ConsultationPipeline:
             result.status = "ready"
             if self.tone_enabled is False:
                 result.tone_status = "disabled"
+            if self.tone_enabled is True:
+                if tone_error_fields is not None:
+                    log_event(
+                        "tone_result",
+                        task_seq=task_seq,
+                        tone_status=result.tone_status or "unknown",
+                        **tone_error_fields,
+                    )
+                else:
+                    log_event("tone_result", task_seq=task_seq, tone_status=result.tone_status or "unknown")
         except ProcessingCancelled as exc:
             result.status = "cancelled"
             result.error = _safe_error(exc)
+            log_event("cancel", task_seq=task_seq, stage=current_stage)
         except Exception as exc:
             result.status = "failed"
             result.error = _safe_error(exc)
+            failure_fields = exception_fields(exc)
         finally:
+            terminal_stage = current_stage
             timing("cleanup")
             if emotion_recognizer is not None:
                 try:
@@ -508,6 +571,23 @@ class ConsultationPipeline:
                     pass
             result.elapsed_seconds = time.perf_counter() - started
             timing("cleanup", 1.0)
+            if result.status == "failed" and failure_fields is not None:
+                log_event(
+                    "terminal",
+                    task_seq=task_seq,
+                    outcome="failed",
+                    stage=terminal_stage,
+                    tone_status=result.tone_status or "unknown",
+                    **failure_fields,
+                )
+            else:
+                log_event(
+                    "terminal",
+                    task_seq=task_seq,
+                    outcome=result.status,
+                    stage=terminal_stage,
+                    tone_status=result.tone_status or "unknown",
+                )
         return result
 
     def export_file(
@@ -573,6 +653,10 @@ class ConsultationPipeline:
         except Exception as exc:
             result.status = "export_failed"
             result.error = _safe_error(exc)
+            export_task_seq = result.diagnostic_task_seq
+            if export_task_seq is None:
+                export_task_seq = begin_task()
+            log_event("export", task_seq=export_task_seq, outcome="failed", **exception_fields(exc))
             raise
         result.word_path = word_path
         result.json_path = json_path
@@ -581,6 +665,10 @@ class ConsultationPipeline:
         result.exported_revision = result.revision
         result.status = "exported"
         result.error = ""
+        export_task_seq = result.diagnostic_task_seq
+        if export_task_seq is None:
+            export_task_seq = begin_task()
+        log_event("export", task_seq=export_task_seq, outcome="success")
         return word_path, json_path
 
 
