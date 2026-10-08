@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -29,7 +27,7 @@ def _available_stem(directory: Path, requested: str) -> str:
     base = _safe_stem(requested)
     candidate = base
     suffix = 2
-    while (directory / f"{candidate}.docx").exists() or (directory / f"{candidate}.json").exists():
+    while (directory / f"{candidate}.docx").exists():
         candidate = f"{base} ({suffix})"
         suffix += 1
     return candidate
@@ -42,98 +40,9 @@ def _temporary_path(directory: Path, suffix: str) -> Path:
         return Path(file.name)
 
 
-def _install_pair(
-    temporary_paths: tuple[Path, Path],
-    target_paths: tuple[Path, Path],
-    *,
-    overwrite: bool,
-) -> None:
-    """Install a prepared pair, restoring any prior pair if either replace fails."""
-    backups: dict[Path, Path] = {}
-    installed: list[Path] = []
-    unrecoverable_backups: set[Path] = set()
-    try:
-        if overwrite:
-            for target in target_paths:
-                if target.exists() or target.is_symlink():
-                    if not target.is_file():
-                        raise IsADirectoryError(str(target))
-                    backup = _temporary_path(target.parent, ".backup")
-                    backup.unlink()
-                    os.replace(target, backup)
-                    backups[target] = backup
-        elif any(target.exists() or target.is_symlink() for target in target_paths):
-            raise FileExistsError("An export target already exists")
-
-        for temporary, target in zip(temporary_paths, target_paths):
-            os.replace(temporary, target)
-            installed.append(target)
-    except Exception:
-        for target in installed:
-            try:
-                target.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for target, backup in backups.items():
-            try:
-                os.replace(backup, target)
-            except OSError:
-                # Keep the only remaining copy available for manual recovery.
-                unrecoverable_backups.add(backup)
-        raise
-    finally:
-        for backup in backups.values():
-            if backup in unrecoverable_backups:
-                continue
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
 def _stamp(seconds: float) -> str:
     whole = max(0, int(seconds))
     return f"{whole // 60:02d}:{whole % 60:02d}"
-
-
-def _emotion_reason(reason: Any) -> str:
-    return {
-        "uncertain_word_or_speaker": "转写置信度或说话人归属不确定",
-        "speaker_unassigned": "说话人未可靠归属",
-        "speaker_overlap": "存在说话人重叠",
-        "no_speaker_track": "当前时间没有说话人轨道覆盖",
-        "speaker_alignment_mismatch": "转写词与说话人轨道不一致",
-        "window_too_short": "可靠语音窗口过短",
-        "emotion_runtime_failed": "情绪模型运行失败",
-    }.get(str(reason), "当前窗口无法可靠分析")
-
-
-def _acoustic_summary(acoustic: Mapping[str, Any]) -> list[str]:
-    parts: list[str] = []
-    rate = acoustic.get("speech_rate_chinese_chars_per_min")
-    if isinstance(rate, (int, float)):
-        count = acoustic.get("chinese_character_count")
-        duration = acoustic.get("denominator_seconds")
-        if isinstance(count, int) and isinstance(duration, (int, float)):
-            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟（{count} 字/{float(duration):.2f} 秒）")
-        else:
-            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟")
-    rms = acoustic.get("rms_dbfs")
-    if isinstance(rms, (int, float)):
-        parts.append(f"音量 RMS {float(rms):.1f} dBFS")
-    pause_count, pause_total = acoustic.get("pause_count"), acoustic.get("pause_total_seconds")
-    if isinstance(pause_count, int) and isinstance(pause_total, (int, float)):
-        parts.append(f"内部停顿 {pause_count} 次/{float(pause_total):.2f} 秒")
-    pitch = acoustic.get("f0_median_hz")
-    if isinstance(pitch, (int, float)):
-        parts.append(f"音高基频中位数 {float(pitch):.1f} Hz")
-    contour = acoustic.get("final_contour_candidate")
-    if contour in {"up", "down", "flat"}:
-        translated = {"up": "上扬", "down": "下降", "flat": "平稳"}[contour]
-        delta = acoustic.get("semitone_delta")
-        detail = f"（{float(delta):+.1f} 半音）" if isinstance(delta, (int, float)) else ""
-        parts.append(f"句末音高走势候选：{translated}{detail}，不代表疑问句判断")
-    return parts
 
 
 def merge_adjacent_turns(words: list[dict[str, Any]], max_gap_seconds: float = 2.0) -> list[dict[str, Any]]:
@@ -178,50 +87,23 @@ def write_exports(
     tone_model: Mapping[str, Any] | None = None,
     sentence_revisions: Mapping[str, Mapping[str, Any]] | None = None,
     revision: int = 0,
-    overwrite_paths: tuple[str | os.PathLike[str], str | os.PathLike[str]] | None = None,
-    source_fingerprint: Mapping[str, int] | None = None,
-    performance: Mapping[str, Any] | None = None,
-) -> tuple[Path, Path]:
-    """Write a Word transcript and JSON sidecar, optionally replacing a saved pair."""
+    target_path: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Write only a Word transcript, optionally to an explicitly selected path."""
     directory = Path(output_dir).expanduser().resolve()
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise ValueError("revision must be a non-negative integer")
-    fingerprint_payload: dict[str, int] | None = None
-    if source_fingerprint is not None:
-        if not isinstance(source_fingerprint, Mapping):
-            raise TypeError("source_fingerprint must be a mapping")
-        fingerprint_payload = {}
-        for key in ("size_bytes", "mtime_ns"):
-            value = source_fingerprint.get(key)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError("source_fingerprint values must be non-negative integers")
-            fingerprint_payload[key] = value
-    overwrite = overwrite_paths is not None
-    if overwrite_paths is None:
+    if target_path is None:
         directory.mkdir(parents=True, exist_ok=True)
         stem = _available_stem(directory, filename)
         word_path = directory / f"{stem}.docx"
-        json_path = directory / f"{stem}.json"
     else:
-        if len(overwrite_paths) != 2:
-            raise ValueError("overwrite_paths must contain the Word and JSON target paths")
-        word_path, json_path = (
-            Path(path).expanduser().resolve(strict=False) for path in overwrite_paths
-        )
-        if word_path == json_path:
-            raise ValueError("Word and JSON export paths must be different")
-        if (
-            word_path.parent != directory
-            or json_path.parent != directory
-            or word_path.suffix.lower() != ".docx"
-            or json_path.suffix.lower() != ".json"
-            or word_path.stem != json_path.stem
-        ):
-            raise ValueError("overwrite_paths must be a matching pair inside output_dir")
+        word_path = Path(target_path).expanduser().resolve(strict=False)
+        if word_path.parent != directory or word_path.suffix.lower() != ".docx":
+            raise ValueError("Word target must be a .docx file inside output_dir")
         word_path.parent.mkdir(parents=True, exist_ok=True)
-        json_path.parent.mkdir(parents=True, exist_ok=True)
     temp_word: Path | None = None
-    temp_json: Path | None = None
 
     speaker_names = {"speaker_1": "说话人1", "speaker_2": "说话人2"}
     if role_labels:
@@ -237,11 +119,15 @@ def write_exports(
         }
         for turn in sorted(segments, key=lambda item: (float(item["start"]), float(item["end"])))
     ]
+    feature_windows = analysis_windows if analysis_windows is not None else [
+        {**turn, "analysis_safe": turn.get("analysis_safe", True)}
+        for turn in turns if isinstance(turn.get("acoustics"), dict)
+    ]
     use_revisions = sentence_revisions is not None or revision != 0
     sentences = (
-        revise_sentences(words, sentence_revisions, emotion_windows, tone_enabled)
+        revise_sentences(words, sentence_revisions, emotion_windows, tone_enabled, feature_windows)
         if use_revisions
-        else build_sentences(words, emotion_windows, tone_enabled)
+        else build_sentences(words, emotion_windows, tone_enabled, feature_windows)
     )
     doc = Document()
     doc.add_heading("咨询记录", level=1)
@@ -262,37 +148,13 @@ def write_exports(
         for value in (segments, emotion_windows, analysis_windows, tone_enabled, tone_status, tone_model)
     ) or use_revisions
     if has_extended_analysis:
-        doc.add_heading("语音特征与情绪倾向", level=2)
+        doc.add_heading("说明", level=2)
         doc.add_paragraph(
             "声学语速根据可靠窗口内的 ASR 文字估算；情绪标签表示模型给出的语音倾向，不用于诊断。"
             "模型置信分数为未校准的原始输出，不是咨询场景准确率或概率。句末音高走势只描述声学变化，"
             "不据此判定疑问句。每句括号取同一说话人、与句中文字时间重叠最多的可靠窗口及其原始分数；"
-            "句中语音未被可靠情绪窗口完整覆盖时显示无法判定。"
+            "句中语音未被可靠情绪窗口完整覆盖时显示无法判定。音量、音调/基频、语速、停顿及音高走势统一列在句后括号，取同一说话人的最大重叠可靠声学窗口。声学数值是该窗口的统计，不是对整句重新测量；覆盖不足或数值缺失时显示—。"
         )
-        feature_windows = analysis_windows if analysis_windows is not None else []
-        if feature_windows:
-            for window in feature_windows:
-                speaker = speaker_names.get(window.get("speaker_id"), "说话人待确认")
-                timestamp = f"[{_stamp(float(window['start']))}–{_stamp(float(window['end']))}] "
-                acoustic = window.get("acoustics")
-                parts = _acoustic_summary(acoustic) if isinstance(acoustic, dict) else []
-                if parts:
-                    doc.add_paragraph(f"{timestamp}{speaker}：" + "；".join(parts))
-                elif not window.get("analysis_safe"):
-                    doc.add_paragraph(
-                        f"{timestamp}{speaker}：声学特征未知（{_emotion_reason(window.get('reason'))}）"
-                    )
-        else:
-            # Keep compatibility with callers that still provide turn-level acoustics.
-            for turn in turns:
-                acoustic = turn.get("acoustics")
-                if not isinstance(acoustic, dict):
-                    continue
-                parts = _acoustic_summary(acoustic)
-                if parts:
-                    speaker = speaker_names.get(turn.get("speaker_id"), "说话人（待确认）")
-                    timestamp = f"[{_stamp(turn['start'])}–{_stamp(turn['end'])}] "
-                    doc.add_paragraph(f"{timestamp}{speaker}：" + "；".join(parts))
         if tone_enabled is False:
             doc.add_paragraph("语音情绪分析：已关闭。")
         else:
@@ -300,84 +162,21 @@ def write_exports(
                 status_text = "部分失败" if tone_status == "partial" else "失败"
                 doc.add_paragraph(f"语音情绪分析：{status_text}。" + (tone_error.strip() or "模型运行失败。"))
 
-    json_words = [
-        {
-            "start": float(word["start"]),
-            "end": float(word["end"]),
-            "text": str(word.get("text", "")),
-            "speaker_id": word.get("speaker_id"),
-            "speaker": speaker_names.get(word.get("speaker_id"), "说话人（待确认）"),
-            "uncertain": bool(word.get("uncertain", False)),
-        }
-        for word in sorted(words, key=lambda item: (float(item["start"]), float(item["end"])))
-    ]
-    json_turns = [
-        {**turn, "speaker": speaker_names.get(turn.get("speaker_id"), "说话人（待确认）")}
-        for turn in turns
-    ]
-    payload = {
-        "schema_version": 2 if has_extended_analysis else 1,
-        "status": status,
-        "source_file": Path(source_name).name,
-        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "duration_seconds": duration_seconds,
-        "roles_confirmed": bool(roles_confirmed),
-        "speakers": speaker_names,
-        "word_count": len(json_words),
-        "words": json_words,
-        "segments": json_turns,
-    }
-    if performance is not None:
-        if not isinstance(performance, Mapping):
-            raise TypeError("performance must be a mapping")
-        payload["processing"] = dict(performance)
-    if fingerprint_payload is not None:
-        payload["source_fingerprint"] = fingerprint_payload
-    if has_extended_analysis:
-        payload["sentences"] = [
-            {**sentence, "speaker": speaker_names.get(sentence.get("speaker_id"), "说话人（待确认）"),
-             "annotated_text": format_sentence(sentence)}
-            for sentence in sentences
-        ]
-        if use_revisions:
-            payload["revision"] = revision
-        payload["tone_analysis"] = {
-            "enabled": tone_enabled,
-            "status": tone_status,
-            "error": tone_error or None,
-            "model": dict(tone_model or {}),
-            "score_interpretation": "raw_uncalibrated_model_score",
-            "limitations": "情绪标签仅表示模型给出的语音倾向，不用于诊断；分数不是咨询场景校准概率。",
-        }
-        payload["emotion_windows"] = [
-            {
-                **{key: value for key, value in window.items() if not str(key).startswith("_")},
-                "speaker": speaker_names.get(window.get("speaker_id"), "说话人（待确认）"),
-            }
-            for window in (emotion_windows or [])
-        ]
-        payload["analysis_windows"] = [
-            {
-                **{key: value for key, value in window.items() if not str(key).startswith("_")},
-                "speaker": speaker_names.get(window.get("speaker_id"), "说话人（待确认）"),
-            }
-            for window in (analysis_windows or [])
-        ]
-
     try:
         temp_word = _temporary_path(word_path.parent, ".docx")
         doc.save(temp_word)
-        temp_json = _temporary_path(json_path.parent, ".json")
-        with temp_json.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
-            file.write("\n")
-
-        _install_pair((temp_word, temp_json), (word_path, json_path), overwrite=overwrite)
-        return word_path, json_path
+        if overwrite:
+            os.replace(temp_word, word_path)
+        elif os.name == "nt":
+            # Windows rename refuses existing targets and supports FAT volumes.
+            os.rename(temp_word, word_path)
+        else:
+            # Publish without replacing a file created after the filename check.
+            os.link(temp_word, word_path)
+        return word_path
     finally:
-        for path in (temp_word, temp_json):
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        if temp_word is not None:
+            try:
+                temp_word.unlink(missing_ok=True)
+            except OSError:
+                pass

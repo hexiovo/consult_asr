@@ -25,13 +25,14 @@ try {
     [IO.File]::WriteAllText($temporaryConfig, "$projectRoot`n$pythonPath`n$ffmpegPath`n", [Text.UTF8Encoding]::new($false))
     & $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 `
         /reference:System.Windows.Forms.dll `
+        /reference:System.Drawing.dll `
         "/win32icon:$projectRoot\assets\consult_asr.ico" `
         "/win32manifest:$PSScriptRoot\launcher.manifest" `
         "/resource:$temporaryConfig,ConsultASR.Config" `
         "/resource:$PSScriptRoot\launcher_probe.py,ConsultASR.Probe" `
         "/out:$stagedExe" "$PSScriptRoot\Launcher.cs"
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw 'EXE build failed.' }
-    foreach ($checkMode in @('--check', '--check-native')) {
+    foreach ($checkMode in @('--check', '--check-native', '--check-startup')) {
         $process = Start-Process -FilePath $stagedExe -ArgumentList $checkMode -PassThru -WindowStyle Hidden
         if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Launcher check timed out.' }
         if ($process.ExitCode -ne 0) { throw "Launcher $checkMode failed with exit code $($process.ExitCode)." }

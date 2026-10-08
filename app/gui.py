@@ -7,7 +7,7 @@ import copy
 from pathlib import Path
 from threading import Event
 
-from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings, QStandardPaths
+from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings, QStandardPaths, QEventLoop
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QPainter, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
@@ -388,19 +388,6 @@ class MainWindow(QMainWindow):
         self._play_generation = 0
         self._started_play_generation: int | None = None
         self._media_source_fingerprint: dict[str, int] | None = None
-        try:
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-
-            self._audio_output = QAudioOutput(self)
-            self._media_player = QMediaPlayer(self)
-            self._media_player.setAudioOutput(self._audio_output)
-            self._media_player.positionChanged.connect(self._media_position_changed)
-            self._media_player.mediaStatusChanged.connect(self._media_status_changed)
-            self._media_player.errorOccurred.connect(self._media_error)
-        except Exception as exc:
-            self._media_player = None
-            self._audio_output = None
-            self._audio_unavailable_reason = type(exc).__name__
         self._time_estimator = TimeEstimator()
         self._timing_profile: str | None = None
         self._timing_settings = QSettings("ConsultASR", "LocalTiming")
@@ -471,11 +458,11 @@ class MainWindow(QMainWindow):
 
         self.choose_files_button = QPushButton("选择录音")
         self.choose_files_button.setObjectName("secondaryButton")
-        self.choose_files_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word + JSON。")
+        self.choose_files_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word。")
         self.choose_files_button.clicked.connect(self._choose_files)
         self.choose_folder_button = QPushButton("选择文件夹")
         self.choose_folder_button.setObjectName("secondaryButton")
-        self.choose_folder_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word + JSON。")
+        self.choose_folder_button.setToolTip("选择新录音批次会替换当前批次；有未导出的结果时请先保存 Word。")
         self.choose_folder_button.clicked.connect(self._choose_folder)
         self.clear_button = QPushButton("清空队列")
         self.clear_button.setObjectName("quietButton")
@@ -642,15 +629,11 @@ class MainWindow(QMainWindow):
         self.open_word_button = QPushButton("打开 Word")
         self.open_word_button.setObjectName("secondaryButton")
         self.open_word_button.clicked.connect(lambda: self._open_selected("word"))
-        self.open_json_button = QPushButton("打开 JSON")
-        self.open_json_button.setObjectName("secondaryButton")
-        self.open_json_button.clicked.connect(lambda: self._open_selected("json"))
-        self.save_button = QPushButton("保存 Word + JSON")
+        self.save_button = QPushButton("保存 Word")
         self.save_button.setObjectName("primaryButton")
-        self.save_button.setToolTip("保存尚未导出的文件，以及角色设置发生变化的文件。")
+        self.save_button.setToolTip("选择文件名和位置，仅保存 Word；批量结果逐个选择。")
         self.save_button.clicked.connect(self._save_results)
         result_actions.addWidget(self.open_word_button)
-        result_actions.addWidget(self.open_json_button)
         result_actions.addWidget(self.save_button)
         review_layout.addLayout(result_actions)
 
@@ -678,7 +661,7 @@ class MainWindow(QMainWindow):
         output_layout.setSpacing(7)
         output_layout.addWidget(QLabel("保存到"))
         self.output_edit = QLineEdit(str(OUTPUT_DIR))
-        self.output_edit.setToolTip("结果保存到此文件夹；Word 与 JSON 会成对保存。")
+        self.output_edit.setToolTip("保存时默认打开此文件夹，可选择文件名和位置；仅保存 Word。")
         self.output_edit.editingFinished.connect(self._persist_session)
         output_layout.addWidget(self.output_edit, 1)
         choose_output = QPushButton("更改…")
@@ -791,7 +774,7 @@ class MainWindow(QMainWindow):
         self._show_selected_analysis()
         self._refresh_model_state()
         self._update_counts()
-        self._restore_session()
+        # Always start with an empty queue; do not load a previous session.
 
     def _show_user_guide(self):
         if self._guide_dialog is None:
@@ -922,7 +905,7 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("替换当前批次")
         dialog.setText(
             "新选择会替换当前批次的队列、校对和角色确认，并删除本地恢复记录。"
-            "尚未导出的结果可能丢失，请先保存 Word + JSON。"
+            "尚未导出的结果可能丢失，请先保存 Word。"
         )
         dialog.setInformativeText("选择“替换当前批次”继续；取消、按 Esc 或关闭此窗口都会保留当前工作。")
         cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -1106,8 +1089,8 @@ class MainWindow(QMainWindow):
                 raise ValueError("缓存校对说话人无效")
 
         word_path_text, json_path_text = record.get("word_path"), record.get("json_path")
-        if (word_path_text is None) != (json_path_text is None):
-            raise ValueError("缓存导出配对无效")
+        if json_path_text is not None and word_path_text is None:
+            raise ValueError("缓存导出路径无效")
         if any(
             value is not None and (not isinstance(value, str) or len(value) > 4096)
             for value in (word_path_text, json_path_text)
@@ -1116,15 +1099,12 @@ class MainWindow(QMainWindow):
         word_path = Path(word_path_text).expanduser().resolve(strict=False) if word_path_text else None
         json_path = Path(json_path_text).expanduser().resolve(strict=False) if json_path_text else None
         output_dir = Path(output_text).expanduser().resolve(strict=False)
-        if word_path is not None and json_path is not None:
+        if word_path is not None:
             if (
                 word_path.parent != output_dir
-                or json_path.parent != output_dir
                 or word_path.suffix.casefold() != ".docx"
-                or json_path.suffix.casefold() != ".json"
-                or word_path.stem.casefold() != json_path.stem.casefold()
             ):
-                raise ValueError("缓存导出配对无效")
+                raise ValueError("缓存 Word 导出路径无效")
 
         revision = record.get("revision", 0)
         exported_revision = record.get("exported_revision", -1)
@@ -1269,14 +1249,12 @@ class MainWindow(QMainWindow):
                 if current is None or expected_fingerprint is None or current != expected_fingerprint:
                     analysis.source_changed = True
                 if analysis.status == "exported":
-                    pair_exists = bool(
+                    word_exists = bool(
                         analysis.word_path
-                        and analysis.json_path
                         and analysis.word_path.is_file()
-                        and analysis.json_path.is_file()
                         and analysis.exported_revision == analysis.revision
                     )
-                    if not pair_exists:
+                    if not word_exists:
                         analysis.status = "no_speech" if not analysis.words else "ready"
                         analysis.error = "上次导出文件缺失或版本已变化，请重新保存。"
                 restored_count += 1
@@ -1411,7 +1389,7 @@ class MainWindow(QMainWindow):
         try:
             self._session_store.write(_json_value(payload))
         except (ResultStoreError, OSError, TypeError, ValueError):
-            self._session_error = "本地恢复记录未能保存；当前处理仍可继续，请及时导出 Word + JSON。"
+            self._session_error = "本地恢复记录未能保存；当前处理仍可继续，请及时导出 Word。"
             if not getattr(self, "_session_warning_shown", False):
                 self._session_warning_shown = True
                 QMessageBox.warning(self, "本地恢复未保存", self._session_error)
@@ -1463,7 +1441,7 @@ class MainWindow(QMainWindow):
             or bool(getattr(result, "source_changed", False))
         ]
         if not pending_rows:
-            QMessageBox.information(self, "队列已完成", "没有需要重新处理的文件；如需补存结果，请使用“保存 Word + JSON”。")
+            QMessageBox.information(self, "队列已完成", "没有需要重新处理的文件；如需补存结果，请使用“保存 Word”。")
             return
         for row in pending_rows:
             if self.analyses[row] is not None:
@@ -1655,7 +1633,7 @@ class MainWindow(QMainWindow):
             self._persist_session()
 
     def _base_sentences(self, result: FileAnalysis) -> list[dict]:
-        return build_sentences(result.words, result.emotion_windows, result.tone_enabled)
+        return build_sentences(result.words, result.emotion_windows, result.tone_enabled, result.analysis_windows)
 
     def _populate_sentence_review(self, row: int, result: FileAnalysis):
         base = self._base_sentences(result)
@@ -1679,9 +1657,9 @@ class MainWindow(QMainWindow):
         self.sentence_editor.setEnabled(enabled)
         self.sentence_speaker_combo.setEnabled(enabled)
         self.save_correction_button.setEnabled(False)
-        self.play_sentence_button.setEnabled(enabled and self._media_player is not None)
+        self.play_sentence_button.setEnabled(enabled and not self._audio_unavailable_reason)
         self.stop_audio_button.setEnabled(self._media_player is not None)
-        if self._media_player is None:
+        if self._audio_unavailable_reason:
             self.sentence_precision_note.setText("当前环境无法启用本地回听；转写、校对和导出仍可使用。")
         elif result.source_changed:
             self.sentence_precision_note.setText("源音频已变化；旧结果与校对已保留，请先重新处理后再回听或导出。")
@@ -1808,12 +1786,39 @@ class MainWindow(QMainWindow):
         elif self.save_correction_button is not None:
             self.save_correction_button.setEnabled(False)
         if not silent:
-            self.progress_label.setText("已保存校对；原始识别文字和时间戳已保留，保存 Word + JSON 可同步导出修订。")
+            self.progress_label.setText("已保存校对；原始识别文字和时间戳已保留，保存 Word 可同步导出修订。")
+
+    def _ensure_audio_player(self) -> bool:
+        """Open audio devices only when playback is requested, never at startup."""
+        if self._media_player is not None:
+            return True
+        if self._audio_unavailable_reason:
+            return False
+        self.sentence_precision_note.setText("正在初始化本地回听设备，请稍候…")
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        try:
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+            self._audio_output = QAudioOutput(self)
+            self._media_player = QMediaPlayer(self)
+            self._media_player.setAudioOutput(self._audio_output)
+            self._media_player.positionChanged.connect(self._media_position_changed)
+            self._media_player.mediaStatusChanged.connect(self._media_status_changed)
+            self._media_player.errorOccurred.connect(self._media_error)
+        except Exception as exc:
+            for component in (self._media_player, self._audio_output):
+                if component is not None:
+                    component.deleteLater()
+            self._media_player = None
+            self._audio_output = None
+            self._audio_unavailable_reason = type(exc).__name__
+            self.play_sentence_button.setEnabled(False)
+            self.sentence_precision_note.setText("当前环境无法启用本地回听；转写、校对和导出仍可使用。")
+            return False
+        self.sentence_precision_note.setText("回听按识别时间范围定位；首次使用时才初始化音频设备。")
+        return True
 
     def _play_selected_sentence(self):
-        if self._media_player is None:
-            QMessageBox.information(self, "无法回听", "当前环境无法启用本地音频回听；转写仍可继续。")
-            return
         row = self.table.currentRow()
         sentence_id = self.sentence_combo.currentData()
         if row < 0 or row >= len(self.analyses) or self.analyses[row] is None or not sentence_id:
@@ -1848,6 +1853,16 @@ class MainWindow(QMainWindow):
             None,
         )
         if sentence is None:
+            return
+        self.play_sentence_button.setEnabled(False)
+        try:
+            if not self._ensure_audio_player():
+                QMessageBox.information(self, "无法回听", "当前环境无法启用本地音频回听；转写仍可继续。")
+                return
+        finally:
+            self.play_sentence_button.setEnabled(not self._audio_unavailable_reason)
+        # Event processing during initialization may change the selected recording.
+        if self.table.currentRow() != row or self.sentence_combo.currentData() != sentence_id:
             return
         start_ms = max(0, int(round(float(sentence["start"]) * 1000)))
         end_ms = max(start_ms + 120, int(round(float(sentence["end"]) * 1000)))
@@ -1975,7 +1990,6 @@ class MainWindow(QMainWindow):
         self.role_combo.setEnabled(False)
         self.save_button.setEnabled(False)
         self.open_word_button.setEnabled(False)
-        self.open_json_button.setEnabled(False)
         if row < 0 or row >= len(self.analyses):
             self.selected_file_label.setText("尚未选择录音")
             self._updating_role = True
@@ -2058,7 +2072,7 @@ class MainWindow(QMainWindow):
         elif result.status == "cancelled":
             self.preview.setPlainText("处理已取消\n" + result.error)
         elif result.status == "no_speech":
-            self.preview.setPlainText("未检测到语音。仍可保存一份标明无语音的 Word 和 JSON 结果。")
+            self.preview.setPlainText("未检测到语音。仍可保存一份标明无语音的 Word 结果。")
         elif result.words:
             lines = []
             reviewed_sentences = revise_sentences(
@@ -2066,6 +2080,7 @@ class MainWindow(QMainWindow):
                 result.sentence_revisions,
                 result.emotion_windows,
                 result.tone_enabled,
+                result.analysis_windows,
             )
             for item in reviewed_sentences:
                 start = max(0, int(float(item["start"])))
@@ -2074,19 +2089,7 @@ class MainWindow(QMainWindow):
                 mark = " 〔待核对〕" if item.get("uncertain") else ""
                 lines.append(f"{timestamp} {speaker}{mark}：{format_sentence(item)}")
             if result.tone_enabled is not None:
-                lines.extend(["", "语音特征"])
-                for window in result.analysis_windows:
-                    features = _format_acoustic_features(window.get("acoustics"))
-                    start = max(0, int(float(window.get("start", 0))))
-                    end = max(0, int(float(window.get("end", 0))))
-                    timestamp = f"[{start // 60:02d}:{start % 60:02d}–{end // 60:02d}:{end % 60:02d}]"
-                    speaker = _speaker_label(window.get("speaker_id"))
-                    if features:
-                        lines.append(f"{timestamp} {speaker}：{features}")
-                    elif not window.get("analysis_safe"):
-                        lines.append(
-                            f"{timestamp} {speaker}：声学特征未知（{_emotion_reason_zh(window.get('reason'))}）"
-                        )
+                lines.extend(["", "句后声学数据取对应说话人的重叠分析窗口；缺失时显示—。"])
                 if result.tone_enabled is False:
                     lines.append("情绪倾向分析：已关闭。")
                 else:
@@ -2108,7 +2111,6 @@ class MainWindow(QMainWindow):
             result.status in {"ready", "no_speech", "exported", "export_failed"} and not result.source_changed
         )
         self.open_word_button.setEnabled(bool(result.word_path and result.word_path.is_file()))
-        self.open_json_button.setEnabled(bool(result.json_path and result.json_path.is_file()))
 
     def _save_results(self):
         if self.save_correction_button.isEnabled():
@@ -2118,43 +2120,61 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "缺少保存目录", "请选择转写结果的保存目录。")
             return
         output_root = Path(output_text).expanduser().resolve()
-        if self.input_root and output_root == self.input_root:
-            QMessageBox.warning(self, "保存目录冲突", "音频文件夹和保存目录不能相同。")
-            return
+        selected_row = self.table.currentRow()
         eligible = [
             (index, item)
             for index, item in enumerate(self.analyses)
             if item is not None
-            and self._needs_export(item, self._output_directory_for_row(index, output_root))
+            and not item.source_changed
+            and item.status in {"ready", "no_speech", "exported", "export_failed"}
+            and (index == selected_row or self._needs_export(item))
         ]
         if not eligible:
-            QMessageBox.information(self, "没有待保存的结果", "结果已保存，所选角色也没有变更。")
+            QMessageBox.information(self, "没有待保存的结果", "请先完成录音处理。")
             return
         pipeline = ConsultationPipeline()
         saved = 0
+        skipped = 0
         errors = []
         for index, result in eligible:
-            speaker = self.role_choices.get(str(result.input_path))
             desired_dir = self._output_directory_for_row(index, output_root)
-            previous_dir = result.output_dir
-            previous_word = result.word_path
-            previous_json = result.json_path
-            changed_target = desired_dir.resolve(strict=False) != previous_dir.resolve(strict=False)
-            if changed_target:
-                result.output_dir = desired_dir
-                result.word_path = None
-                result.json_path = None
+            default_name = result.word_path.name if result.word_path else f"{result.input_path.stem}.docx"
+            dialog = QFileDialog(self, f"保存 Word：{result.input_path.name}", str(desired_dir))
+            dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+            dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+            dialog.setNameFilter("Word 文档 (*.docx)")
+            dialog.setDefaultSuffix("docx")
+            dialog.selectFile(default_name)
+            if not dialog.exec():
+                skipped += 1
+                continue
+            chosen = Path(dialog.selectedFiles()[0]).expanduser()
+            # Qt adds the default suffix for names without an extension.
+            target_path = chosen if chosen.suffix.lower() == ".docx" else Path(str(chosen) + ".docx")
+            target_path = target_path.resolve(strict=False)
+            if target_path != chosen.resolve(strict=False) and target_path.exists():
+                answer = QMessageBox.question(
+                    self, "确认替换", f"{target_path.name} 已存在，是否替换？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    skipped += 1
+                    continue
             try:
-                word_path, json_path = pipeline.export_file(result, counselor_speaker=speaker)
+                if target_path == result.input_path.resolve(strict=False):
+                    raise ValueError("保存路径不能与源音频相同。")
+                word_path = pipeline.export_file(
+                    result,
+                    counselor_speaker=self.role_choices.get(str(result.input_path)),
+                    target_path=target_path,
+                    overwrite=target_path.exists(),
+                )
                 self._set_queue_status(index, "exported", "已导出")
-                self._set_queue_detail(index, f"Word + JSON 已保存：{word_path.name}")
+                self._set_queue_detail(index, f"Word 已保存：{word_path.name}")
                 saved += 1
             except Exception as exc:
                 error = self._redact_result_error(result, str(exc)[:500])
-                if changed_target:
-                    result.output_dir = previous_dir
-                    result.word_path = previous_word
-                    result.json_path = previous_json
                 result.status = "export_failed"
                 result.error = error
                 errors.append(f"{result.input_path.name}：{error[:300]}")
@@ -2163,7 +2183,11 @@ class MainWindow(QMainWindow):
             self._persist_session()
         self._update_counts()
         self._show_selected_analysis()
-        message = f"已保存 {saved} 个 Word + JSON 结果。"
+        if not saved and not errors:
+            return
+        message = f"已保存 {saved} 个 Word 结果。"
+        if skipped:
+            message += f"已跳过 {skipped} 个结果。"
         if errors:
             message += "\n\n导出失败：\n" + "\n".join(errors[:8])
             QMessageBox.warning(self, "导出完成但有失败项", message)
@@ -2199,9 +2223,7 @@ class MainWindow(QMainWindow):
                 requested = None
             files_missing = not (
                 result.word_path
-                and result.json_path
                 and result.word_path.is_file()
-                and result.json_path.is_file()
             )
             return (
                 requested != result.counselor_speaker
@@ -2219,9 +2241,9 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.analyses) or self.analyses[row] is None:
             return
         result = self.analyses[row]
-        path = result.word_path if kind == "word" else result.json_path
+        path = result.word_path
         if path is None or not path.is_file():
-            QMessageBox.information(self, "文件尚未保存", "请先保存 Word 和 JSON 结果。")
+            QMessageBox.information(self, "文件尚未保存", "请先保存 Word 结果。")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
@@ -2275,7 +2297,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def run_app() -> int:
+def run_app(startup_window=None) -> int:
     try:
         try:
             init_logging()
@@ -2291,6 +2313,10 @@ def run_app() -> int:
         window.setWindowIcon(app.windowIcon())
         window.show()
         _configure_window_identity(window)
+        app.processEvents()
+        from app.startup import finish_startup
+
+        finish_startup(startup_window)
         return app.exec()
     finally:
         try:
@@ -2346,51 +2372,6 @@ def _speaker_label(speaker_id: str | None) -> str:
         "speaker_1": "说话人1",
         "speaker_2": "说话人2",
     }.get(speaker_id, "说话人待确认" if not speaker_id else speaker_id)
-
-
-def _format_acoustic_features(value) -> str:
-    if not isinstance(value, dict):
-        return ""
-    parts = []
-    rate = value.get("speech_rate_chinese_chars_per_min")
-    if isinstance(rate, (int, float)):
-        count = value.get("chinese_character_count")
-        duration = value.get("denominator_seconds")
-        if isinstance(count, int) and isinstance(duration, (int, float)):
-            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟（{count} 字/{float(duration):.2f} 秒）")
-        else:
-            parts.append(f"语速（ASR估计）{float(rate):.1f} 个中文字/分钟")
-    rms = value.get("rms_dbfs")
-    if isinstance(rms, (int, float)):
-        parts.append(f"音量 RMS {float(rms):.1f} dBFS")
-    pause_count = value.get("pause_count")
-    pause_seconds = value.get("pause_total_seconds")
-    if isinstance(pause_count, int) and isinstance(pause_seconds, (int, float)):
-        parts.append(f"内部停顿 {pause_count} 次/{float(pause_seconds):.2f} 秒")
-    f0 = value.get("f0_median_hz")
-    if isinstance(f0, (int, float)):
-        parts.append(f"基频中位数 {float(f0):.1f} Hz")
-    contour = value.get("final_contour_candidate")
-    if contour in {"up", "down", "flat"}:
-        label = {"up": "上扬", "down": "下降", "flat": "平稳"}[contour]
-        delta = value.get("semitone_delta")
-        suffix = f" {float(delta):+.1f} 半音" if isinstance(delta, (int, float)) else ""
-        parts.append(f"句末音高走势候选 {label}{suffix}（不直接判断疑问句）")
-    if not parts and value.get("analysis_status") == "invalid":
-        return f"声学分析不可用（{value.get('analysis_reason') or '输入无效'}）"
-    return " · ".join(parts)
-
-
-def _emotion_reason_zh(reason) -> str:
-    return {
-        "uncertain_word_or_speaker": "转写置信度或说话人归属不确定",
-        "speaker_unassigned": "说话人未可靠归属",
-        "speaker_overlap": "存在说话人重叠",
-        "no_speaker_track": "当前时间没有说话人轨道覆盖",
-        "speaker_alignment_mismatch": "转写词与说话人轨道不一致",
-        "window_too_short": "可靠语音窗口过短",
-        "emotion_runtime_failed": "情绪模型运行失败",
-    }.get(str(reason), "当前窗口无法可靠分析")
 
 
 def _set_status_badge(label: QLabel, text: str, tone: str) -> None:
@@ -2516,8 +2497,16 @@ def _window_stylesheet() -> str:
     }
     QPushButton#primaryButton:hover { background: #2f614b; border-color: #2f614b; }
     QPushButton#primaryButton:disabled { color: #8c9990; background: #dfe7e0; border-color: #dfe7e0; }
-    QPushButton#quietButton { background: transparent; border-color: transparent; color: #62756a; }
-    QPushButton#quietButton:hover { background: #edf2ed; border-color: #e2e9e1; }
+    QPushButton:focus { border-color: #386c55; }
+    QPushButton#secondaryButton { background: #edf4ef; border-color: #c5d8cc; color: #305641; }
+    QPushButton#secondaryButton:hover { background: #dfebe2; border-color: #9fbea9; }
+    QPushButton#secondaryButton:pressed { background: #cbded1; }
+    QPushButton#secondaryButton:disabled { color: #96a197; background: #edf0ec; border-color: #e4e8e3; }
+    QPushButton#quietButton { background: #e0eeea; border-color: #b2cdc5; color: #24574c; }
+    QPushButton#quietButton:hover { background: #cee3dc; border-color: #89b3a6; }
+    QPushButton#quietButton:pressed, QPushButton#quietButton:checked { background: #bdd8cd; border-color: #739e8f; }
+    QPushButton#quietButton:focus, QPushButton#secondaryButton:focus { border-color: #386c55; }
+    QPushButton#quietButton:disabled { color: #96a197; background: #edf0ec; border-color: #e4e8e3; }
     QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTableWidget {
         color: #293a32;
         background: #ffffff;

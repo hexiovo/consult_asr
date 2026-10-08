@@ -1,22 +1,25 @@
 using System;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("咨询录音转写")]
 [assembly: AssemblyDescription("本地双人中文咨询录音转写 · 本机启动版")]
 [assembly: AssemblyProduct("ConsultASR")]
-[assembly: AssemblyVersion("2.4.4.0")]
-[assembly: AssemblyFileVersion("2.4.4.0")]
+[assembly: AssemblyVersion("2.4.8.0")]
+[assembly: AssemblyFileVersion("2.4.8.0")]
 
 internal static class Launcher
 {
     [STAThread]
     private static int Main(string[] args)
     {
-        bool nativeCheck = args.Length == 1 && args[0] == "--check-native";
+        bool startupCheck = args.Length == 1 && args[0] == "--check-startup";
+        bool nativeCheck = startupCheck || (args.Length == 1 && args[0] == "--check-native");
         bool check = nativeCheck || (args.Length == 1 && args[0] == "--check");
         try
         {
@@ -64,8 +67,23 @@ internal static class Launcher
                 start.EnvironmentVariables["CONSULT_ASR_FFMPEG"] = ffmpeg;
             if (check) start.EnvironmentVariables["QT_QPA_PLATFORM"] = nativeCheck ? "windows" : "offscreen";
 
+            bool displayStartup = !check || startupCheck;
+            string eventName = "Local\\ConsultASR.Startup." + Guid.NewGuid().ToString("N");
+            if (displayStartup)
+            {
+                start.EnvironmentVariables["CONSULT_ASR_STARTUP_EVENT"] = eventName;
+                if (startupCheck) start.EnvironmentVariables["CONSULT_ASR_CHECK_STARTUP"] = "1";
+                Application.EnableVisualStyles();
+            }
+            using (EventWaitHandle startupReady = new EventWaitHandle(false, EventResetMode.ManualReset, eventName))
+            using (StartupWindow splash = new StartupWindow())
             using (Process process = new Process())
             {
+                if (displayStartup)
+                {
+                    splash.Show();
+                    splash.Refresh();
+                }
                 process.StartInfo = start;
                 // Drain console streams without retaining or writing consultation content.
                 process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) { };
@@ -73,15 +91,78 @@ internal static class Launcher
                 if (!process.Start()) return Fail(check, "无法启动转写程序。", 3);
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
+                bool startupSignaled = false;
+                if (displayStartup)
+                {
+                    using (System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer())
+                    {
+                        timer.Interval = 100;
+                        timer.Tick += delegate
+                        {
+                            startupSignaled = startupReady.WaitOne(0);
+                            if (startupSignaled || process.HasExited) splash.Close();
+                        };
+                        timer.Start();
+                        Application.Run(splash);
+                    }
+                }
                 process.WaitForExit();
                 if (process.ExitCode != 0)
                     return Fail(check, "转写程序异常退出。\n请检查现有 Python 环境，或查看项目 log 文件夹中的诊断日志。", process.ExitCode);
+                if (startupCheck && !startupSignaled)
+                    return Fail(check, "启动窗口未收到主界面就绪通知。", 5);
             }
             return 0;
         }
         catch (Exception)
         {
             return Fail(check, "启动失败。请确认项目目录及本地运行环境可访问，再重新启动。", 4);
+        }
+    }
+
+    private sealed class StartupWindow : Form
+    {
+        private readonly Icon appIcon;
+
+        internal StartupWindow()
+        {
+            Text = "咨询录音转写 · 正在启动";
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            ControlBox = false;
+            ShowInTaskbar = false;
+            AutoScaleMode = AutoScaleMode.Dpi;
+            ClientSize = new Size(440, 210);
+            BackColor = Color.FromArgb(255, 254, 250);
+            ForeColor = Color.FromArgb(36, 87, 76);
+            Font = new Font("Microsoft YaHei UI", 10F);
+            appIcon = Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location);
+            Icon = appIcon;
+            Label title = new Label();
+            title.Text = "咨询录音转写";
+            title.Font = new Font(Font.FontFamily, 18F, FontStyle.Bold);
+            title.SetBounds(28, 26, 380, 42);
+            Controls.Add(title);
+            Label status = new Label();
+            status.Text = "正在启动，请稍候…";
+            status.SetBounds(30, 83, 380, 30);
+            Controls.Add(status);
+            ProgressBar progress = new ProgressBar();
+            progress.Style = ProgressBarStyle.Marquee;
+            progress.MarqueeAnimationSpeed = 25;
+            progress.SetBounds(30, 128, 380, 8);
+            Controls.Add(progress);
+            Label detail = new Label();
+            detail.Text = "正在准备界面与本地资源";
+            detail.ForeColor = Color.FromArgb(82, 100, 90);
+            detail.SetBounds(30, 153, 380, 28);
+            Controls.Add(detail);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing && appIcon != null) appIcon.Dispose();
         }
     }
 

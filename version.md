@@ -1,7 +1,36 @@
 # Version
 
-Current version: **2.4.4**
+Current version: **2.4.8**
 Updated: 2026-10-08
+
+## 2.4.8
+
+- Present emotion, confidence, RMS volume, pitch/F0, speech rate, pauses and pitch contour together in the same sentence-ending parentheses in both preview and Word; remove the separate per-window feature listing.
+- Associate acoustic values with the original speaker's safe window with the largest spoken-word overlap, require full reliable coverage, preserve source-window metadata and corrected-sentence timing, and show missing values as —.
+- Verify matching sentence annotations across the preview, Word writer and export pipeline; cover speaker isolation, unavailable/disabled emotion, unsafe/partial/invalid/nonfinite acoustic data, multiple analysis windows, corrected punctuation and speaker overrides. Rebuild the local EXE and pass all three launcher checks.
+- Synchronize the native manifest version with 2.4.8 and remove local IDE settings, Python bytecode and runtime logs from version control.
+- Remove hardcoded Hugging Face credentials from early Git history before publishing master; the current configuration already contains no hardcoded token.
+
+## 2.4.7
+
+- Start every new application window with an empty queue, transcript preview and role selection instead of automatically restoring the previous session.
+- Preserve exported Word files and update the user guide to reflect the new startup behavior.
+- Reproduce the previous automatic restore with an isolated cached transcript; verify empty startup despite existing cache, reset correction/role/export controls, preserved saved files, new audio selection, and repeated blank launches. Rebuild the local EXE and pass all three launcher checks with an explicit empty-startup assertion.
+
+## 2.4.6
+
+- Let users select each Word filename and destination in a save dialog, including saving the current exported result under a new name; cancellation leaves its export state unchanged.
+- Export only `.docx`, remove the JSON result action and paired-export requirement, and retain internal session recovery with compatibility for prior saved results.
+- Keep source fingerprint validation, corrected transcript/roles/features, and atomic Word replacement; update the local user guide and launcher version.
+- Verify custom names, batch Word-only exports, corrections/roles, no-speech documents, old/new session restore, cancellation, save-as, collision protection, failed replacement cleanup, confirmed replacement, and stale-source blocking. Rebuild and replace the local EXE; all three launcher checks pass.
+
+## 2.4.5
+
+- Show an animated native “正在启动，请稍候…” window before the EXE starts Python; close it after the main window is shown, using a per-launch ready event. Source launches also display a lightweight Qt startup window.
+- Initialize audio playback devices on the first sentence playback instead of blocking application startup. In isolated offscreen checks with no restored session, main-window construction/display dropped from approximately 6–7.5 seconds to 0.19 seconds; first playback still initializes the devices.
+- Give guide/log/status/advanced buttons a pale teal background, dark text, visible borders, and hover/pressed/focus/disabled states; use sage green for secondary actions and update guide-window action colors.
+- Add a native startup-handshake check to the validated EXE replacement workflow.
+- Verify the source startup handoff, lazy playback/reuse/failure handling, actual playback/stop with a generated silent WAV, guide/button colors and layout, Python syntax, and all three launcher checks; rebuild and replace the local EXE.
 
 ## 2.4.4
 

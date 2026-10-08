@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import math
 import os
 import re
@@ -102,52 +101,6 @@ def _source_fingerprint(path: Path) -> tuple[int, int] | None:
     except OSError:
         return None
     return int(stat.st_size), int(stat.st_mtime_ns)
-
-
-def _known_export_pair(result: FileAnalysis) -> tuple[Path, Path] | None:
-    """Return only a previously exported, same-directory Word/JSON pair."""
-    if (
-        isinstance(result.exported_revision, bool)
-        or not isinstance(result.exported_revision, int)
-        or result.exported_revision < 0
-        or result.word_path is None
-        or result.json_path is None
-    ):
-        return None
-    directory = result.output_dir.expanduser().resolve()
-    word_path = result.word_path.expanduser().resolve(strict=False)
-    json_path = result.json_path.expanduser().resolve(strict=False)
-    if (
-        word_path.parent != directory
-        or json_path.parent != directory
-        or word_path.suffix.lower() != ".docx"
-        or json_path.suffix.lower() != ".json"
-        or word_path.stem != json_path.stem
-    ):
-        return None
-    if not json_path.is_file():
-        return None
-    try:
-        with json_path.open("r", encoding="utf-8") as sidecar:
-            payload = json.load(sidecar)
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict) or payload.get("source_file") != result.input_path.name:
-        return None
-    source_fingerprint = payload.get("source_fingerprint")
-    if (
-        not isinstance(source_fingerprint, dict)
-        or isinstance(source_fingerprint.get("size_bytes"), bool)
-        or not isinstance(source_fingerprint.get("size_bytes"), int)
-        or isinstance(source_fingerprint.get("mtime_ns"), bool)
-        or not isinstance(source_fingerprint.get("mtime_ns"), int)
-        or result.source_size_bytes is None
-        or result.source_mtime_ns is None
-        or source_fingerprint["size_bytes"] != result.source_size_bytes
-        or source_fingerprint["mtime_ns"] != result.source_mtime_ns
-    ):
-        return None
-    return word_path, json_path
 
 
 def _release_memory() -> None:
@@ -595,7 +548,9 @@ class ConsultationPipeline:
         result: FileAnalysis,
         *,
         counselor_speaker: str | None = None,
-    ) -> tuple[Path, Path]:
+        target_path: Path | None = None,
+        overwrite: bool = False,
+    ) -> Path:
         if result.status not in {"ready", "no_speech", "exported", "export_failed"}:
             raise ValueError("只有识别完成或无语音的文件可以导出。")
         try:
@@ -627,10 +582,10 @@ class ConsultationPipeline:
                     int(result.performance.get("effective_batch_size", 0) or 0),
                     int(result.performance.get("cpu_threads", self.cpu_threads)),
                 )
-            overwrite_paths = _known_export_pair(result)
-            word_path, json_path = write_exports(
+            output_dir = target_path.parent if target_path is not None else result.output_dir
+            word_path = write_exports(
                 words=result.words,
-                output_dir=result.output_dir,
+                output_dir=output_dir,
                 filename=result.input_path.stem,
                 source_name=result.input_path.name,
                 duration_seconds=result.duration_seconds,
@@ -646,9 +601,8 @@ class ConsultationPipeline:
                 tone_model=result.tone_model,
                 sentence_revisions=result.sentence_revisions,
                 revision=result.revision,
-                overwrite_paths=overwrite_paths,
-                source_fingerprint={"size_bytes": fingerprint[0], "mtime_ns": fingerprint[1]},
-                performance=result.performance,
+                target_path=target_path,
+                overwrite=overwrite,
             )
         except Exception as exc:
             result.status = "export_failed"
@@ -659,7 +613,8 @@ class ConsultationPipeline:
             log_event("export", task_seq=export_task_seq, outcome="failed", **exception_fields(exc))
             raise
         result.word_path = word_path
-        result.json_path = json_path
+        result.output_dir = word_path.parent
+        result.json_path = None
         result.roles_confirmed = roles_confirmed
         result.counselor_speaker = counselor_speaker if roles_confirmed else None
         result.exported_revision = result.revision
@@ -669,7 +624,7 @@ class ConsultationPipeline:
         if export_task_seq is None:
             export_task_seq = begin_task()
         log_event("export", task_seq=export_task_seq, outcome="success")
-        return word_path, json_path
+        return word_path
 
 
 def _merge_turns(words: list[dict[str, Any]], gap: float = 1.5) -> list[dict[str, Any]]:

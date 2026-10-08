@@ -23,11 +23,24 @@ with tempfile.TemporaryDirectory(prefix="consult-asr-launch-check-") as temp:
     app = QApplication([])
     gui._configure_application_icon(app)
     assert not app.windowIcon().isNull()
-    with patch.object(gui.MainWindow, "_restore_session"), patch.object(
+    with patch.object(
+        gui.MainWindow, "_restore_session", side_effect=AssertionError("Startup must not restore old results")
+    ), patch.object(
         gui.MainWindow, "_persist_session"
     ), patch.object(gui.MainWindow, "_refresh_model_state"):
         window = gui.MainWindow()
+        assert not window.input_files and not window.analyses and not window.role_choices
+        assert window.table.rowCount() == 0 and window.table.currentRow() == -1
+        assert not window.save_button.isEnabled() and not window.open_word_button.isEnabled()
         assert not window.windowIcon().isNull()
+        assert window._media_player is None and window._audio_output is None
+        if os.environ.get("CONSULT_ASR_CHECK_STARTUP") == "1":
+            from app.startup import finish_startup
+
+            window.show()
+            app.processEvents()
+            assert window.isVisible()
+            assert finish_startup()
         if app.platformName() == "windows":
             import ctypes as c
             from utils.windows_shell import _Key, _Variant, _guid, _PROPERTY_GUID

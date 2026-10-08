@@ -1,4 +1,4 @@
-"""Sentence presentation shared by the preview and paired exports."""
+"""Sentence presentation shared by the preview and Word export."""
 
 from __future__ import annotations
 
@@ -73,14 +73,62 @@ def _sentence_emotion(sentence: Mapping[str, Any], windows: list[dict[str, Any]]
             "method": "same_speaker_largest_word_overlap_window"}
 
 
+def _sentence_acoustics(sentence: Mapping[str, Any], windows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attach an actual safe-window measurement, never average window statistics."""
+    unknown = {"status": "unknown", "values": {}}
+    if sentence["uncertain"] or sentence["speaker_id"] not in {"speaker_1", "speaker_2"}:
+        return {**unknown, "reason": "uncertain_word_or_speaker"}
+    intervals = _merged_intervals(sentence["_intervals"])
+    candidates = []
+    for window in windows:
+        values = window.get("acoustics")
+        if (
+            window.get("speaker_id") != sentence["speaker_id"]
+            or window.get("analysis_safe") is not True
+            or not isinstance(values, Mapping)
+            or values.get("analysis_status") == "invalid"
+        ):
+            continue
+        try:
+            start, end = float(window["start"]), float(window["end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        overlap = sum(max(0.0, min(end, right) - max(start, left)) for left, right in intervals)
+        if overlap > 0:
+            candidates.append((overlap, start, end, values))
+    covered = _merged_intervals([(item[1], item[2]) for item in candidates])
+    for start, end in intervals:
+        cursor = start
+        for left, right in covered:
+            if right <= cursor:
+                continue
+            if left > cursor + 1e-6:
+                break
+            cursor = max(cursor, right)
+            if cursor >= end - 1e-6:
+                break
+        if cursor < end - 1e-6:
+            return {**unknown, "reason": "incomplete_acoustic_coverage"}
+    if not candidates:
+        return {**unknown, "reason": "no_reliable_acoustic_window"}
+    _, start, end, values = max(candidates, key=lambda item: (item[0], -item[1]))
+    return {"status": "ok", "values": dict(values),
+            "source_window": {"start": start, "end": end},
+            "method": "same_speaker_largest_word_overlap_window"}
+
+
 def build_sentences(words: list[dict[str, Any]], emotion_windows: list[dict[str, Any]] | None = None,
-                    tone_enabled: bool | None = None) -> list[dict[str, Any]]:
+                    tone_enabled: bool | None = None,
+                    analysis_windows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Split at punctuation, speaker changes and gaps over two seconds.
 
     Fragments inside one ASR word retain that word's original time bounds;
     character-level timestamps are not fabricated.
     """
-    return _build_sentences(words, emotion_windows, tone_enabled, preserve_intervals=False)
+    return _build_sentences(words, emotion_windows, tone_enabled,
+                            analysis_windows=analysis_windows, preserve_intervals=False)
 
 
 def make_sentence_id(original_sentence_index: int, start: float, end: float) -> str:
@@ -122,6 +170,7 @@ def revise_sentences(
     overrides: Mapping[str, Mapping[str, Any]] | None = None,
     emotion_windows: list[dict[str, Any]] | None = None,
     tone_enabled: bool | None = None,
+    analysis_windows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply sentence-level edits and return display/export fragments.
 
@@ -131,7 +180,8 @@ def revise_sentences(
     ``fragment_id`` distinguishes the fragments in the current revision.
     Timing is never divided at character boundaries.
     """
-    base_sentences = _build_sentences(words, emotion_windows, tone_enabled, preserve_intervals=True)
+    base_sentences = _build_sentences(words, emotion_windows, tone_enabled,
+                                     analysis_windows=analysis_windows, preserve_intervals=True)
     windows = emotion_windows or []
     output: list[dict[str, Any]] = []
 
@@ -177,6 +227,8 @@ def revise_sentences(
                     "text": fragment,
                     "uncertain": source["uncertain"],
                     "emotion": emotion,
+                    "acoustics": source["acoustics"],
+                    "acoustics_from_original_speaker": speaker_changed,
                 }
             )
     return output
@@ -187,6 +239,7 @@ def _build_sentences(
     emotion_windows: list[dict[str, Any]] | None,
     tone_enabled: bool | None,
     *,
+    analysis_windows: list[dict[str, Any]] | None,
     preserve_intervals: bool,
 ) -> list[dict[str, Any]]:
     sentences: list[dict[str, Any]] = []
@@ -196,6 +249,7 @@ def _build_sentences(
         nonlocal current
         if current is not None and current["text"].strip():
             current["text"] = current["text"].strip()
+            current["acoustics"] = _sentence_acoustics(current, analysis_windows or [])
             if not preserve_intervals:
                 current["emotion"] = _sentence_emotion(current, emotion_windows or [], tone_enabled)
                 current.pop("_intervals")
@@ -240,4 +294,32 @@ def format_sentence(sentence: Mapping[str, Any]) -> str:
         detail = "可能情绪：无法判定；置信度：—"
         if emotion["status"] == "disabled":
             detail += "；情绪分析已关闭"
+    acoustic = sentence.get("acoustics", {})
+    values = acoustic.get("values", {}) if acoustic.get("status") == "ok" else {}
+
+    def numeric(key: str) -> float | None:
+        value = values.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return float(value)
+        return None
+
+    volume = numeric("rms_dbfs")
+    pitch = numeric("f0_median_hz")
+    rate = numeric("speech_rate_chinese_chars_per_min")
+    count = numeric("pause_count")
+    duration = numeric("pause_total_seconds")
+    detail += "；音量：" + (f"{volume:.1f} dBFS" if volume is not None else "—")
+    detail += "；音调/基频：" + (f"{pitch:.1f} Hz" if pitch is not None else "—")
+    detail += "；语速：" + (f"{rate:.1f} 字/分钟" if rate is not None else "—")
+    detail += "；停顿：" + (
+        f"{int(count)} 次/{duration:.2f} 秒" if count is not None and duration is not None else "—"
+    )
+    contour = values.get("final_contour_candidate")
+    contour_label = {"up": "上扬", "down": "下降", "flat": "平稳"}.get(contour, "—")
+    delta = numeric("semitone_delta")
+    if contour_label != "—" and delta is not None:
+        contour_label += f" {delta:+.1f} 半音"
+    detail += f"；音高走势：{contour_label}"
+    if sentence.get("acoustics_from_original_speaker") and acoustic.get("status") == "ok":
+        detail += "；声学数据沿用原音频"
     return f"{sentence['text']}（{detail}）"
