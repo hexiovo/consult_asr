@@ -16,15 +16,18 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
     QGroupBox,
+    QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -538,6 +541,7 @@ class MainWindow(QMainWindow):
         review = QGroupBox("转写预览")
         review.setObjectName("surfaceCard")
         review_layout = QVBoxLayout(review)
+        review_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         review_layout.setContentsMargins(12, 17, 12, 10)
         review_layout.setSpacing(8)
         review_header = QHBoxLayout()
@@ -570,11 +574,16 @@ class MainWindow(QMainWindow):
         review_layout.addWidget(self.preview, 1)
 
         correction_box = QGroupBox("逐句校对与回听")
+        correction_box.setObjectName("correctionCard")
+        self.correction_box = correction_box
         correction_layout = QVBoxLayout(correction_box)
+        correction_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         correction_layout.setContentsMargins(8, 9, 8, 7)
         correction_layout.setSpacing(5)
         sentence_row = QHBoxLayout()
         self.sentence_combo = QComboBox()
+        self.sentence_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.sentence_combo.setMinimumContentsLength(12)
         self.sentence_combo.setObjectName("sageCombo")
         self.sentence_combo.currentIndexChanged.connect(self._sentence_selected)
         sentence_row.addWidget(self.sentence_combo, 1)
@@ -605,7 +614,8 @@ class MainWindow(QMainWindow):
 
         self.sentence_editor = QPlainTextEdit()
         self.sentence_editor.setPlaceholderText("可修订当前句子的文字；原始识别文本和时间戳会保留。")
-        self.sentence_editor.setMaximumHeight(76)
+        self.sentence_editor.setMinimumHeight(64)
+        self.sentence_editor.setMaximumHeight(96)
         self.sentence_editor.textChanged.connect(self._sentence_edit_changed)
         correction_layout.addWidget(self.sentence_editor)
         self.sentence_precision_note = QLabel(
@@ -648,9 +658,15 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(7)
         queue.setMinimumWidth(300)
-        review.setMinimumWidth(420)
+        self.review_scroll = QScrollArea()
+        self.review_scroll.setObjectName("reviewScroll")
+        self.review_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.review_scroll.setWidgetResizable(True)
+        self.review_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.review_scroll.setMinimumWidth(420)
+        self.review_scroll.setWidget(review)
         splitter.addWidget(queue)
-        splitter.addWidget(review)
+        splitter.addWidget(self.review_scroll)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
         outer.addWidget(splitter, 1)
@@ -2265,11 +2281,16 @@ def run_app() -> int:
             init_logging()
         except Exception:
             pass
+        from utils.windows_shell import set_process_identity
+
+        set_process_identity()
         app = QApplication.instance() or QApplication([])
         _configure_application_icon(app)
         _configure_application_fonts(app)
         window = MainWindow()
+        window.setWindowIcon(app.windowIcon())
         window.show()
+        _configure_window_identity(window)
         return app.exec()
     finally:
         try:
@@ -2283,13 +2304,20 @@ def _configure_application_icon(app: QApplication) -> None:
     icon = QIcon(str(icon_path))
     if not icon.isNull():
         app.setWindowIcon(icon)
-    if os.name == "nt":
-        try:
-            import ctypes
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ConsultASR.Desktop")
-        except (AttributeError, OSError):
-            pass
+
+def _configure_window_identity(window: QMainWindow) -> dict[str, bool]:
+    app = QApplication.instance()
+    if os.name != "nt" or app is None or app.platformName() != "windows":
+        return {"icons": False, "shell": False}
+    from utils.windows_shell import set_window_identity, release_icons
+
+    icon_path = Path(__file__).resolve().parents[1] / "assets" / "consult_asr.ico"
+    launcher = os.environ.get("CONSULT_ASR_LAUNCHER_PATH", "")
+    result, handles = set_window_identity(int(window.winId()), icon_path, launcher)
+    if handles:
+        window.destroyed.connect(lambda *_: release_icons(handles))
+    return result
 
 
 def _file_status(status: str) -> tuple[str, str]:
@@ -2442,6 +2470,20 @@ def _window_stylesheet() -> str:
     QGroupBox#surfaceCard::title {
         subcontrol-origin: margin;
         left: 13px;
+        padding: 0 4px;
+        color: #52645a;
+    }
+    QScrollArea#reviewScroll { background: transparent; border: none; }
+    QGroupBox#correctionCard {
+        background: #f7f9f6;
+        border: 1px solid #dde6dd;
+        border-radius: 9px;
+        margin-top: 7px;
+        font-weight: normal;
+    }
+    QGroupBox#correctionCard::title {
+        subcontrol-origin: margin;
+        left: 10px;
         padding: 0 4px;
         color: #52645a;
     }

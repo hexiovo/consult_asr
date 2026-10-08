@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.4.3**
+Current version: **2.4.4**
 Updated: 2026-10-08
+
+## 2.4.4
+
+- Prevent sentence correction controls from collapsing at small window sizes or increased display scaling; scroll the review panel when its full content does not fit.
+- Bind native Windows window icons and taskbar relaunch properties to the custom icon and launcher EXE rather than the child Python executable.
+- Extend launcher checks to cover layout geometry and Windows window identity, and support validated replacement of an existing EXE.
 
 ## 2.4.3
 

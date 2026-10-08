@@ -1,6 +1,7 @@
 param(
     [string]$OutputDirectory = 'F:\桌面\程序\APP',
-    [string]$PythonExe = 'G:\conda\.conda\envs\consult_asr_fast\python.exe'
+    [string]$PythonExe = 'G:\conda\.conda\envs\consult_asr_fast\python.exe',
+    [switch]$Replace
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
@@ -10,7 +11,10 @@ if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Windows .NE
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $outputRoot = (Resolve-Path -LiteralPath $OutputDirectory).Path
 $target = Join-Path $outputRoot '咨询录音转写.exe'
-if (Test-Path -LiteralPath $target) { throw 'The output EXE already exists. Choose a new output directory or move the previous EXE first.' }
+if ((Test-Path -LiteralPath $target) -and -not $Replace) { throw 'The output EXE already exists. Use -Replace for a validated update.' }
+$stagedExe = Join-Path $outputRoot ('.consult-asr-stage-' + [guid]::NewGuid().ToString('N') + '.exe')
+$backupExe = Join-Path $outputRoot ('.consult-asr-previous-' + [guid]::NewGuid().ToString('N') + '.bak')
+$published = $false
 $temporaryConfig = Join-Path $outputRoot ('.launcher-config-' + [guid]::NewGuid().ToString('N') + '.txt')
 try {
     Push-Location -LiteralPath $projectRoot
@@ -25,12 +29,22 @@ try {
         "/win32manifest:$PSScriptRoot\launcher.manifest" `
         "/resource:$temporaryConfig,ConsultASR.Config" `
         "/resource:$PSScriptRoot\launcher_probe.py,ConsultASR.Probe" `
-        "/out:$target" "$PSScriptRoot\Launcher.cs"
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) { throw 'EXE build failed.' }
-    $process = Start-Process -FilePath $target -ArgumentList '--check' -PassThru -WindowStyle Hidden
-    if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Launcher check timed out.' }
-    if ($process.ExitCode -ne 0) { throw "Launcher check failed with exit code $($process.ExitCode)." }
+        "/out:$stagedExe" "$PSScriptRoot\Launcher.cs"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw 'EXE build failed.' }
+    foreach ($checkMode in @('--check', '--check-native')) {
+        $process = Start-Process -FilePath $stagedExe -ArgumentList $checkMode -PassThru -WindowStyle Hidden
+        if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Launcher check timed out.' }
+        if ($process.ExitCode -ne 0) { throw "Launcher $checkMode failed with exit code $($process.ExitCode)." }
+    }
+    if (Test-Path -LiteralPath $target) {
+        [IO.File]::Replace($stagedExe, $target, $backupExe)
+    } else {
+        Move-Item -LiteralPath $stagedExe -Destination $target
+    }
+    $published = $true
     Write-Output "Built and checked: $target"
 } finally {
     if (Test-Path -LiteralPath $temporaryConfig) { Remove-Item -LiteralPath $temporaryConfig }
+    if (Test-Path -LiteralPath $stagedExe) { Remove-Item -LiteralPath $stagedExe }
+    if ($published -and (Test-Path -LiteralPath $backupExe)) { Remove-Item -LiteralPath $backupExe }
 }

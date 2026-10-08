@@ -8,15 +8,16 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("咨询录音转写")]
 [assembly: AssemblyDescription("本地双人中文咨询录音转写 · 本机启动版")]
 [assembly: AssemblyProduct("ConsultASR")]
-[assembly: AssemblyVersion("2.4.3.0")]
-[assembly: AssemblyFileVersion("2.4.3.0")]
+[assembly: AssemblyVersion("2.4.4.0")]
+[assembly: AssemblyFileVersion("2.4.4.0")]
 
 internal static class Launcher
 {
     [STAThread]
     private static int Main(string[] args)
     {
-        bool check = args.Length == 1 && args[0] == "--check";
+        bool nativeCheck = args.Length == 1 && args[0] == "--check-native";
+        bool check = nativeCheck || (args.Length == 1 && args[0] == "--check");
         try
         {
             string[] config = ReadResource("ConsultASR.Config").Trim().Split('\n');
@@ -58,9 +59,10 @@ internal static class Launcher
             start.EnvironmentVariables["HF_HUB_OFFLINE"] = "1";
             start.EnvironmentVariables["TRANSFORMERS_OFFLINE"] = "1";
             start.EnvironmentVariables["HF_HUB_DISABLE_TELEMETRY"] = "1";
+            start.EnvironmentVariables["CONSULT_ASR_LAUNCHER_PATH"] = Assembly.GetExecutingAssembly().Location;
             if (File.Exists(ffmpeg) && String.IsNullOrWhiteSpace(start.EnvironmentVariables["CONSULT_ASR_FFMPEG"]))
                 start.EnvironmentVariables["CONSULT_ASR_FFMPEG"] = ffmpeg;
-            if (check) start.EnvironmentVariables["QT_QPA_PLATFORM"] = "offscreen";
+            if (check) start.EnvironmentVariables["QT_QPA_PLATFORM"] = nativeCheck ? "windows" : "offscreen";
 
             using (Process process = new Process())
             {

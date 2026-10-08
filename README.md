@@ -6,7 +6,9 @@ Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使�
 
 本机入口为 `F:\桌面\程序\APP\咨询录音转写.exe`，双击即可启动，没有控制台黑窗口。EXE 使用内嵌的青金双色对话图标，应用窗口和任务栏也使用同一图标。
 
-这是复用已部署资源的本机启动版：仍需保留本项目、`consult_asr_fast` Python 环境、本地模型与情绪运行时；不能只复制 EXE 到另一台电脑直接运行。程序目录或环境移动后，应重新打包。构建命令：`powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1`；可指定 `-PythonExe` 和 `-OutputDirectory`。构建会对真实 EXE 执行 `--check`，在隔离的 Qt offscreen 窗口验证启动及图标，不读取实际会话或执行模型推理。
+这是复用已部署资源的本机启动版：仍需保留本项目、`consult_asr_fast` Python 环境、本地模型与情绪运行时；不能只复制 EXE 到另一台电脑直接运行。程序目录或环境移动后，应重新打包。构建命令：`powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1`；可指定 `-PythonExe` 和 `-OutputDirectory`，更新已存在的 EXE 时加 `-Replace`。候选版本通过 `--check` 布局检查及 `--check-native` 原生窗口／任务栏属性检查后，才替换旧 EXE；这些检查使用隔离的空会话，不执行模型推理。
+
+窗口较小或显示缩放较大时，右侧预览面板可上下滚动，逐句校对、角色确认和导出控件不会压叠。任务栏入口关联启动 EXE 的内嵌图标，使用青金双色对话标识。
 
 完整操作说明见 [使用指南](USER_GUIDE.md)。也可点击界面右上角“使用指南”，在本地窗口按章节跳转或搜索；录音处理中仍可查看。
 
