@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Event
 
 from PySide6.QtCore import QThread, Qt, Signal, QUrl, QTimer, QPoint, QSettings, QStandardPaths
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPolygon
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QPainter, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -2266,6 +2266,7 @@ def run_app() -> int:
         except Exception:
             pass
         app = QApplication.instance() or QApplication([])
+        _configure_application_icon(app)
         _configure_application_fonts(app)
         window = MainWindow()
         window.show()
@@ -2274,6 +2275,20 @@ def run_app() -> int:
         try:
             shutdown_logging()
         except Exception:
+            pass
+
+
+def _configure_application_icon(app: QApplication) -> None:
+    icon_path = Path(__file__).resolve().parents[1] / "assets" / "consult_asr.ico"
+    icon = QIcon(str(icon_path))
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ConsultASR.Desktop")
+        except (AttributeError, OSError):
             pass
 
 

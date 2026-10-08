@@ -2,6 +2,12 @@
 
 Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使用 pyannote.audio 区分两位说话人，并可用 emotion2vec 展示语音情绪倾向和声学特征。保存前可预览文本并确认角色；音频与转写只在本机处理。
 
+## 双击 EXE 启动（本机版）
+
+本机入口为 `F:\桌面\程序\APP\咨询录音转写.exe`，双击即可启动，没有控制台黑窗口。EXE 使用内嵌的青金双色对话图标，应用窗口和任务栏也使用同一图标。
+
+这是复用已部署资源的本机启动版：仍需保留本项目、`consult_asr_fast` Python 环境、本地模型与情绪运行时；不能只复制 EXE 到另一台电脑直接运行。程序目录或环境移动后，应重新打包。构建命令：`powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1`；可指定 `-PythonExe` 和 `-OutputDirectory`。构建会对真实 EXE 执行 `--check`，在隔离的 Qt offscreen 窗口验证启动及图标，不读取实际会话或执行模型推理。
+
 完整操作说明见 [使用指南](USER_GUIDE.md)。也可点击界面右上角“使用指南”，在本地窗口按章节跳转或搜索；录音处理中仍可查看。
 
 带实际界面截图的版本见 [PDF 图文使用指南](output/pdf/咨询录音转写_图文使用指南.pdf)，也可在指南窗口点击“打开 PDF 指南”，使用本机 PDF 阅读器查看。该 PDF 是 v2.3.2 历史版；当前识别设置以本页链接的 USER_GUIDE.md 为准。

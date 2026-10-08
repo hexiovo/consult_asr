@@ -1,7 +1,13 @@
 # Version
 
-Current version: **2.4.2**
-Updated: 2026-10-04
+Current version: **2.4.3**
+Updated: 2026-10-08
+
+## 2.4.3
+
+- Add a native Windows EXE launcher for the existing local Python, GPU and model environment, with no console window or duplicated model assets.
+- Add a custom multi-resolution jade/gold dialogue icon to the EXE, application windows and Windows taskbar.
+- Add a reproducible local build and isolated offline Qt launch check; keep the application directory and validated runtime as required local resources.
 
 ## 2.4.2
 
