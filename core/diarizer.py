@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +44,18 @@ class Diarizer:
         except ImportError as exc:
             raise RuntimeError("缺少 pyannote.audio 或 PyTorch 运行依赖，请按部署说明安装。") from exc
         try:
-            self.pipeline = Pipeline.from_pretrained(
-                str(self.model_path / "config.yaml"),
-                use_auth_token=False,
-            )
+            import yaml
+            from core.model_paths import resolve_checkpoint
+
+            config = yaml.safe_load((self.model_path / "config.yaml").read_text(encoding="utf-8"))
+            params = config["pipeline"]["params"]
+            for field in ("segmentation", "embedding"):
+                params[field] = str(resolve_checkpoint(params[field], self.model_path))
+            # pyannote 3.1 requires a file and opens it with the Windows ANSI codec.
+            with tempfile.TemporaryDirectory(prefix="consult-asr-pyannote-") as temporary:
+                resolved_config = Path(temporary) / "config.yaml"
+                resolved_config.write_text(yaml.safe_dump(config, allow_unicode=False), encoding="ascii")
+                self.pipeline = Pipeline.from_pretrained(str(resolved_config), use_auth_token=False)
             self.pipeline.to(torch.device(self.device))
         except Exception as exc:
             self.pipeline = None

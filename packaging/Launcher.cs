@@ -8,10 +8,10 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("咨询录音转写")]
-[assembly: AssemblyDescription("本地双人中文咨询录音转写 · 本机启动版")]
+[assembly: AssemblyDescription("本地双人中文咨询录音转写")]
 [assembly: AssemblyProduct("ConsultASR")]
-[assembly: AssemblyVersion("2.4.8.0")]
-[assembly: AssemblyFileVersion("2.4.8.0")]
+[assembly: AssemblyVersion("2.5.0.0")]
+[assembly: AssemblyFileVersion("2.5.0.0")]
 
 internal static class Launcher
 {
@@ -27,15 +27,23 @@ internal static class Launcher
             string project = config[0].Trim();
             string python = config[1].Trim();
             string ffmpeg = config.Length > 2 ? config[2].Trim() : "";
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            bool portable = config.Length > 3 && config[3].Trim() == "portable";
+            if (portable)
+            {
+                project = Path.GetFullPath(Path.Combine(baseDirectory, project));
+                python = Path.GetFullPath(Path.Combine(baseDirectory, python));
+                ffmpeg = Path.GetFullPath(Path.Combine(baseDirectory, ffmpeg));
+            }
             DirectoryInfo parent = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\', '/'));
-            if (parent != null)
+            if (!portable && parent != null)
             {
                 string sibling = Path.Combine(parent.FullName, "consult_asr");
                 if (File.Exists(Path.Combine(sibling, "consult_asr.py"))) project = sibling;
             }
             string entry = Path.Combine(project, "consult_asr.py");
             if (!File.Exists(python) || !File.Exists(entry))
-                return Fail(check, "启动所需的程序目录或 Python 环境不存在。\n请保留 consult_asr 项目及 consult_asr_fast 环境，或重新运行打包脚本。", 2);
+                return Fail(check, "启动所需的程序目录或 Python 环境不存在。\n发布版请先运行 setup.bat 完成部署，并保留整个 ConsultASR 文件夹。", 2);
 
             string arguments = "-X utf8 -B \"" + entry + "\"";
             if (check)
@@ -51,7 +59,7 @@ internal static class Launcher
             start.RedirectStandardOutput = true;
             start.RedirectStandardError = true;
             string prefix = Path.GetDirectoryName(python);
-            string extraPath = prefix + ";" + Path.Combine(prefix, "Scripts") + ";" +
+            string extraPath = Path.GetDirectoryName(ffmpeg) + ";" + prefix + ";" + Path.Combine(prefix, "Scripts") + ";" +
                 Path.Combine(prefix, "Library", "bin") + ";" +
                 Path.Combine(prefix, "Lib", "site-packages", "torch", "lib");
             start.EnvironmentVariables["PATH"] = extraPath + ";" + (start.EnvironmentVariables["PATH"] ?? "");

@@ -1,7 +1,9 @@
-param(
-    [string]$OutputDirectory = 'F:\桌面\程序\APP',
-    [string]$PythonExe = 'G:\conda\.conda\envs\consult_asr_fast\python.exe',
-    [switch]$Replace
+﻿param(
+    [string]$OutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\launcher'),
+    [string]$PythonExe = (Get-Command python -ErrorAction Stop).Source,
+    [switch]$Replace,
+    [switch]$Portable,
+    [switch]$SkipChecks
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
@@ -19,10 +21,12 @@ $temporaryConfig = Join-Path $outputRoot ('.launcher-config-' + [guid]::NewGuid(
 try {
     Push-Location -LiteralPath $projectRoot
     try {
-        $ffmpegPath = & $pythonPath -X utf8 -B -c 'import config; print(config.FFMPEG_EXECUTABLE or "")'
+        $ffmpegPath = & $pythonPath -X utf8 -B -c 'import config; print(config.FFMPEG_EXECUTABLE or str())'
         if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the current runtime configuration.' }
     } finally { Pop-Location }
-    [IO.File]::WriteAllText($temporaryConfig, "$projectRoot`n$pythonPath`n$ffmpegPath`n", [Text.UTF8Encoding]::new($false))
+    $launcherConfig = "$projectRoot`n$pythonPath`n$ffmpegPath`n"
+    if ($Portable) { $launcherConfig = ".`n.runtime\python\python.exe`n.runtime\ffmpeg\ffmpeg.exe`nportable`n" }
+    [IO.File]::WriteAllText($temporaryConfig, $launcherConfig, [Text.UTF8Encoding]::new($false))
     & $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 `
         /reference:System.Windows.Forms.dll `
         /reference:System.Drawing.dll `
@@ -33,6 +37,7 @@ try {
         "/out:$stagedExe" "$PSScriptRoot\Launcher.cs"
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagedExe -PathType Leaf)) { throw 'EXE build failed.' }
     foreach ($checkMode in @('--check', '--check-native', '--check-startup')) {
+        if ($SkipChecks) { break } # Release builder validates the installed bundle separately.
         $process = Start-Process -FilePath $stagedExe -ArgumentList $checkMode -PassThru -WindowStyle Hidden
         if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'Launcher check timed out.' }
         if ($process.ExitCode -ne 0) { throw "Launcher $checkMode failed with exit code $($process.ExitCode)." }
@@ -43,7 +48,8 @@ try {
         Move-Item -LiteralPath $stagedExe -Destination $target
     }
     $published = $true
-    Write-Output "Built and checked: $target"
+    if ($SkipChecks) { Write-Output "Built (installation checks pending): $target" }
+    else { Write-Output "Built and checked: $target" }
 } finally {
     if (Test-Path -LiteralPath $temporaryConfig) { Remove-Item -LiteralPath $temporaryConfig }
     if (Test-Path -LiteralPath $stagedExe) { Remove-Item -LiteralPath $stagedExe }

@@ -1,10 +1,20 @@
 # Version
 
-Current version: **2.4.8**
-Updated: 2026-10-08
+Current version: **2.5.0**
+Updated: 2026-10-19
+
+## 2.5.0
+
+- Add a Windows 10/11 x64 deployment package with bundled Python 3.10, locked runtime dependencies, FFmpeg and public ASR/emotion models; target hosts need no preinstalled Python or Conda.
+- Add a double-click installer that downloads fixed-version Release assets, resumes partial downloads, validates SHA-256 checksums, reassembles large archives and installs into a new directory without overwriting existing installations.
+- Use relative launcher/runtime paths and relative pyannote checkpoint references so the application directory can move between locations. Preserve compatibility with existing valid absolute local checkpoints.
+- Keep gated pyannote weights outside the public release; first-time setup prompts for an account-authorized Hugging Face token without saving it. Re-running setup retries model preparation without reinstalling the runtime.
+- Add offline runtime/model diagnostics and deployment/rebuild instructions. Preserve the existing source/Conda launch path.
 
 ## 2.4.8
 
+- 2026-10-08 maintenance: inspect generated caches and unused artifacts and prepare a one-time cleanup command. Agent deletion was blocked by the tool policy; cleanup remains pending manual execution. Preserve dependency lockfiles, model weights, runtime packages, launcher build/check sources and the PDF guide; no application version change.
+- Fix the one-time cleanup script's CMD parsing by using Windows CRLF line endings; reproduce the LF failure with a harmless header-only probe and verify CRLF parsing without deleting project files.
 - Present emotion, confidence, RMS volume, pitch/F0, speech rate, pauses and pitch contour together in the same sentence-ending parentheses in both preview and Word; remove the separate per-window feature listing.
 - Associate acoustic values with the original speaker's safe window with the largest spoken-word overlap, require full reliable coverage, preserve source-window metadata and corrected-sentence timing, and show missing values as —.
 - Verify matching sentence annotations across the preview, Word writer and export pipeline; cover speaker isolation, unavailable/disabled emotion, unsafe/partial/invalid/nonfinite acoustic data, multiple analysis windows, corrected punctuation and speaker overrides. Rebuild the local EXE and pass all three launcher checks.

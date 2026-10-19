@@ -2,11 +2,17 @@
 
 Windows 本地桌面工具：使用 faster-whisper large-v3 转写中文、使用 pyannote.audio 区分两位说话人，并可用 emotion2vec 展示语音情绪倾向和声学特征。保存前可预览文本并确认角色；音频与转写只在本机处理。
 
-## 双击 EXE 启动（本机版）
+## 下载发布版，在其他电脑部署
+
+Windows 10/11 64 位：从 [最新 Release](https://github.com/hexiovo/consult_asr/releases/latest) 下载 `ConsultASR-2.5.0-Windows-x64-Setup.zip`，解压后双击 `setup.bat`。部署工具自动下载并校验配套运行环境和公开模型，无须预装 Python、Conda 或 FFmpeg；中断后重新运行可续传。建议至少 16 GB 内存、30 GB 可用磁盘空间。
+
+首次使用须按提示取得 Hugging Face 的两个 pyannote 模型访问许可，并隐藏输入自己的读取令牌。完成后，双击安装目录内的 `咨询录音转写.exe`；后续离线使用。请保留整个 `ConsultASR` 文件夹，可移动到其他目录。详见 [下载与部署指南](DEPLOYMENT.md)。
+
+## 旧本机启动器与源码构建
 
 本机入口为 `F:\桌面\程序\APP\咨询录音转写.exe`，双击即可启动，没有控制台黑窗口。EXE 使用内嵌的青金双色对话图标，应用窗口和任务栏也使用同一图标。
 
-这是复用已部署资源的本机启动版：仍需保留本项目、`consult_asr_fast` Python 环境、本地模型与情绪运行时；不能只复制 EXE 到另一台电脑直接运行。程序目录或环境移动后，应重新打包。构建命令：`powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1`；可指定 `-PythonExe` 和 `-OutputDirectory`，更新已存在的 EXE 时加 `-Replace`。候选版本通过 `--check` 布局检查及 `--check-native` 原生窗口／任务栏属性检查后，才替换旧 EXE；这些检查使用隔离的空会话，不执行模型推理。
+这是复用已部署资源的旧本机启动版：仍需保留本项目、`consult_asr_fast` Python 环境、本地模型与情绪运行时；其他电脑请使用上面的发布版部署。源码构建命令：`powershell -ExecutionPolicy Bypass -File packaging\build_exe.ps1 -PythonExe <环境中的python.exe>`，默认输出 `dist/launcher`；可指定 `-OutputDirectory`，更新已存在的 EXE 时加 `-Replace`。候选版本通过布局、原生窗口／任务栏属性和启动握手检查后才替换旧 EXE；这些检查使用隔离的空会话，不执行模型推理。
 
 窗口较小或显示缩放较大时，右侧预览面板可上下滚动，逐句校对、角色确认和导出控件不会压叠。任务栏入口关联启动 EXE 的内嵌图标，使用青金双色对话标识。
 

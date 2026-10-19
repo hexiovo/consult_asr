@@ -36,6 +36,9 @@ def _resolve_ffmpeg() -> str | None:
     explicit = os.environ.get("CONSULT_ASR_FFMPEG")
     if explicit and Path(explicit).is_file():
         return str(Path(explicit).resolve())
+    bundled = PROJECT_ROOT / ".runtime" / "ffmpeg" / "ffmpeg.exe"
+    if bundled.is_file():
+        return str(bundled.resolve())
     on_path = shutil.which("ffmpeg")
     if on_path:
         return str(Path(on_path).resolve())

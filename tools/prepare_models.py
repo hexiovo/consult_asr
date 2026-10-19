@@ -177,25 +177,12 @@ def _checkpoint_problem(field: str, reference: Any) -> str | None:
     if not isinstance(reference, str) or not reference.strip():
         return f"{field}: 必须配置本地 pytorch_model.bin 检查点"
 
-    configured = Path(reference).expanduser()
-    if not configured.is_absolute():
-        return f"{field}: 检查点必须使用绝对路径（{reference}）"
-
-    checkpoint = configured.resolve()
-    model_root = DIARIZATION_MODEL_DIR.expanduser().resolve()
     try:
-        checkpoint.relative_to(model_root)
-    except ValueError:
-        return f"{field}: 检查点必须位于本地 pyannote 模型目录中（{reference}）"
+        from core.model_paths import resolve_checkpoint
 
-    if not any(part.casefold() == "pyannote" for part in checkpoint.parts):
-        return f"{field}: 检查点路径必须包含 pyannote 目录段（{reference}）"
-    if checkpoint.name.casefold() != _PYANNOTE_CHECKPOINT_NAME.casefold():
-        return f"{field}: 检查点文件名必须为 {_PYANNOTE_CHECKPOINT_NAME}（{reference}）"
-    if not checkpoint.is_file():
-        return f"{field}: 检查点文件不存在（{reference}）"
-    if checkpoint.stat().st_size == 0:
-        return f"{field}: 检查点文件为空（{reference}）"
+        resolve_checkpoint(reference, DIARIZATION_MODEL_DIR)
+    except ValueError:
+        return f"{field}: 检查点须为模型目录内非空的 pyannote pytorch_model.bin（{reference}）"
     return None
 
 
@@ -266,7 +253,9 @@ def prepare_diarization(token: str | None) -> dict[str, dict[str, str]]:
     replacements: dict[str, str] = {}
     for repo_id, (path, _) in downloaded.items():
         if repo_id != DIARIZATION_REPOSITORY:
-            replacements[repo_id] = str(_local_checkpoint_path(path))
+            replacements[repo_id] = _local_checkpoint_path(path).relative_to(
+                DIARIZATION_MODEL_DIR.resolve()
+            ).as_posix()
 
     for path, _ in downloaded.values():
         for yaml_path in list(path.rglob("*.yaml")) + list(path.rglob("*.yml")):
