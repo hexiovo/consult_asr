@@ -10,6 +10,7 @@ Updated: 2026-10-19
 - Use relative launcher/runtime paths and relative pyannote checkpoint references so the application directory can move between locations. Preserve compatibility with existing valid absolute local checkpoints.
 - Keep gated pyannote weights outside the public release; first-time setup prompts for an account-authorized Hugging Face token without saving it. Re-running setup retries model preparation without reinstalling the runtime.
 - Add offline runtime/model diagnostics and deployment/rebuild instructions. Preserve the existing source/Conda launch path.
+- Validate split archives, SHA-256 rejection, HTTP Range resume, existing-directory protection, model preparation references and a full install with host Python/Conda removed from PATH. Move the installed directory and pass all three EXE probes, synthetic CUDA ASR, offline CPU diarization and isolated CPU emotion inference (nine finite scores); these smoke checks do not measure recognition accuracy.
 
 ## 2.4.8
 
